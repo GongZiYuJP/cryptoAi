@@ -14,6 +14,23 @@ import ta  # 技术指标库
 import json
 import os
 
+# SSL证书配置
+try:
+    import certifi
+    import ssl
+    # 使用certifi提供的CA证书
+    SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
+    USE_SSL_VERIFY = True
+except ImportError:
+    # 如果certifi未安装，尝试使用系统默认证书
+    SSL_CONTEXT = None
+    USE_SSL_VERIFY = True
+    print("⚠️ certifi未安装，建议运行: pip install certifi")
+except Exception as e:
+    print(f"⚠️ SSL证书配置警告: {e}")
+    SSL_CONTEXT = None
+    USE_SSL_VERIFY = False  # 如果证书配置失败，禁用SSL验证（仅用于测试）
+
 # 深度学习库（可选，如果未安装会自动降级）
 try:
     import tensorflow as tf
@@ -67,29 +84,72 @@ DL_PREDICTION_HORIZON = 24  # 预测未来24根K线（24小时）
 DL_TRAIN_INTERVAL = 100  # 每100个新信号后重新训练模型
 DL_MIN_SIGNALS_FOR_TRAIN = 50  # 至少需要50个信号才开始训练
 
-# Binance 交易所配置（币安测试网 - 合约交易）
+# Binance 交易所配置（币安合约交易）
+# 注意：币安已不再支持期货交易的测试网模式，请使用实盘API或演示交易模式
 try:
-    # 配置币安测试网（永续合约交易）
-    exchange = ccxt.binance({
+    # 配置币安（永续合约交易）
+    # 如果使用实盘API，请确保API密钥是实盘的，并设置 'sandbox': False
+    # 如果使用演示交易，可以设置 'options': {'defaultType': 'future', 'defaultSubType': 'linear'}
+    exchange_config = {
         'apiKey': TESTNET_API_KEY,
         'secret': TESTNET_API_SECRET,
-        'sandbox': True,  # 启用测试网模式
+        'sandbox': False,  # 币安已不支持期货测试网，必须设置为False
         'options': {
             'defaultType': 'future',  # 使用永续合约市场
             'defaultMarginMode': 'isolated',  # 逐仓模式（isolated）或全仓模式（cross）
+            # 'disableFuturesSandboxWarning': True,  # 如果仍遇到警告，可以取消注释此行
         },
         'enableRateLimit': True,
         'timeout': 30000,
-    })
-    print("✅ 币安测试网（合约）连接成功")
+        'verify': USE_SSL_VERIFY,  # SSL证书验证
+    }
+    
+    # 如果配置了SSL上下文，使用它
+    if SSL_CONTEXT is not None:
+        try:
+            # 配置requests使用certifi的证书
+            session = requests.Session()
+            if USE_SSL_VERIFY:
+                try:
+                    import certifi
+                    session.verify = certifi.where()
+                except:
+                    pass
+            exchange_config['session'] = session
+        except:
+            pass
+    
+    exchange = ccxt.binance(exchange_config)
+    print("✅ 币安（合约）连接成功")
+    print("⚠️ 注意：币安已不再支持期货测试网，当前使用实盘API")
+    print("⚠️ 请确保API密钥是实盘的，或考虑使用演示交易模式")
+    if not USE_SSL_VERIFY:
+        print("⚠️ 警告：SSL证书验证已禁用，仅用于测试环境")
 except Exception as e:
-    print(f"❌ 币安测试网连接失败: {e}")
+    print(f"❌ 币安连接失败: {e}")
     # 如果配置有问题，使用公共API（仅读取数据，无法交易）
-    exchange = ccxt.binance({
+    exchange_config = {
         'options': {'defaultType': 'future'},
         'enableRateLimit': True,
         'timeout': 30000,
-    })
+        'verify': USE_SSL_VERIFY,
+    }
+    
+    # 配置SSL
+    if SSL_CONTEXT is not None:
+        try:
+            session = requests.Session()
+            if USE_SSL_VERIFY:
+                try:
+                    import certifi
+                    session.verify = certifi.where()
+                except:
+                    pass
+            exchange_config['session'] = session
+        except:
+            pass
+    
+    exchange = ccxt.binance(exchange_config)
     print("⚠️ 使用公共API模式（仅读取数据，无法交易）")
     print("⚠️ 自动交易已禁用，当前为仅监控模式")
 
@@ -561,6 +621,7 @@ def predict_with_dl_model(df):
 # 自我修正交易算法
 def self_correct_trading_algorithm():
     """根据历史信号表现，自我修正交易算法参数"""
+    global SIGNAL_THRESHOLD
     try:
         if not os.path.exists(SIGNAL_HISTORY_FILE):
             return
@@ -604,7 +665,6 @@ def self_correct_trading_algorithm():
                     best_threshold = strength
         
         # 如果发现更好的阈值，建议调整
-        global SIGNAL_THRESHOLD
         if best_threshold != SIGNAL_THRESHOLD and best_win_rate > win_rate + 0.1:
             old_threshold = SIGNAL_THRESHOLD
             SIGNAL_THRESHOLD = max(70, min(90, best_threshold))  # 限制在70-90之间
