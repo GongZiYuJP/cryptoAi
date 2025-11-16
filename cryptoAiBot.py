@@ -4,13 +4,28 @@ import numpy as np
 import requests
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
 import joblib
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 import schedule
 import sys
 import ta  # 技术指标库
+import json
+import os
+
+# 深度学习库（可选，如果未安装会自动降级）
+try:
+    import tensorflow as tf
+    from tensorflow.keras.models import Sequential, load_model
+    from tensorflow.keras.layers import LSTM, Dense, Dropout, Input
+    from tensorflow.keras.optimizers import Adam
+    from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+    TENSORFLOW_AVAILABLE = True
+except ImportError:
+    TENSORFLOW_AVAILABLE = False
+    print("⚠️ TensorFlow未安装，深度学习功能将使用简化版本")
+    print("   安装命令: pip install tensorflow")
 
 # 配置（替换为您的key）
 TESTNET_API_KEY = "ylc7VTuA7zSuWLhEezYYYec6mMZWbH06t7RLTriuvb4ufj4VDZJWEiaRsl7xY0qM"
@@ -20,11 +35,11 @@ TELEGRAM_BOT_TOKEN = "8534033934:AAEZ1AY6K3llNT3viVoYkdRGJSUik_xSrUQ"
 TELEGRAM_CHAT_ID = "1450400854"
 # 监控币种
 COINS = ['BTC', 'ETH', 'SOL', 'XRP', 'BNB']
-# ETH专用配置
-ETH_SYMBOL = 'ETH/USDT'
+# ETH专用配置（合约交易）
+ETH_SYMBOL = 'ETH/USDT:USDT'  # 永续合约格式
 TIMEFRAME = '1h'  # 主时间周期
 SMALL_TIMEFRAMES = ['5m', '15m']  # 小级别K线用于精确入场
-LEVERAGE = {'LONG': 3, 'SHORT': 3}
+LEVERAGE = {'LONG': 3, 'SHORT': 3}  # 杠杆倍数
 RISK_PER_TRADE = 0.01  # 1%风险
 STOP_LOSS_PCT = 0.02  # 2%止损
 TAKE_PROFIT_PCT = 0.06  # 6%止盈，盈亏比3:1
@@ -35,24 +50,48 @@ LOG_FILE = "trading_log.txt"
 MONITOR_INTERVAL = 300  # 5分钟检查一次
 # FVG配置
 FVG_MIN_SIZE = 0.001  # FVG最小大小（0.1%）
+# 自动交易开关
+AUTO_TRADE_ENABLED = False  # 设置为True启用自动交易，False仅监控（当前：仅监控模式，不执行实际交易）
+# 最大持仓数量
+MAX_POSITIONS = 1  # 最多同时持有1个仓位
+# 交易记录文件
+TRADE_RECORD_FILE = "trade_records.json"
+# 信号历史记录文件（用于深度学习）
+SIGNAL_HISTORY_FILE = "signal_history.json"
+# 深度学习模型路径
+DL_MODEL_PATH = "dl_lstm_model.h5"
+DL_SCALER_PATH = "dl_scaler.pkl"
+# 深度学习配置
+DL_SEQUENCE_LENGTH = 60  # 使用60根K线作为输入序列
+DL_PREDICTION_HORIZON = 24  # 预测未来24根K线（24小时）
+DL_TRAIN_INTERVAL = 100  # 每100个新信号后重新训练模型
+DL_MIN_SIGNALS_FOR_TRAIN = 50  # 至少需要50个信号才开始训练
 
-# Binance 交易所配置（使用公共API，无需密钥即可获取K线数据）
+# Binance 交易所配置（币安测试网 - 合约交易）
 try:
-    # 尝试使用配置的API密钥（用于账户查询等）
+    # 配置币安测试网（永续合约交易）
     exchange = ccxt.binance({
         'apiKey': TESTNET_API_KEY,
         'secret': TESTNET_API_SECRET,
-        'options': {'defaultType': 'spot'},  # 使用现货市场获取数据
+        'sandbox': True,  # 启用测试网模式
+        'options': {
+            'defaultType': 'future',  # 使用永续合约市场
+            'defaultMarginMode': 'isolated',  # 逐仓模式（isolated）或全仓模式（cross）
+        },
         'enableRateLimit': True,
         'timeout': 30000,
     })
-except:
-    # 如果配置有问题，使用公共API（无需密钥）
+    print("✅ 币安测试网（合约）连接成功")
+except Exception as e:
+    print(f"❌ 币安测试网连接失败: {e}")
+    # 如果配置有问题，使用公共API（仅读取数据，无法交易）
     exchange = ccxt.binance({
-        'options': {'defaultType': 'spot'},
+        'options': {'defaultType': 'future'},
         'enableRateLimit': True,
         'timeout': 30000,
     })
+    print("⚠️ 使用公共API模式（仅读取数据，无法交易）")
+    print("⚠️ 自动交易已禁用，当前为仅监控模式")
 
 # 获取链上数据分数
 def get_onchain_score(coin):
@@ -103,6 +142,486 @@ def load_or_train_model(df_features, labels):
         model.partial_fit(df_features, labels)  # 假设有新数据
         joblib.dump(model, MODEL_PATH)
     return model
+
+# ==================== 深度学习功能 ====================
+
+# 记录信号历史
+def record_signal_history(signal):
+    """记录交易信号，用于后续学习和评估"""
+    try:
+        if not signal:
+            return
+        
+        # 读取现有记录
+        if os.path.exists(SIGNAL_HISTORY_FILE):
+            with open(SIGNAL_HISTORY_FILE, 'r', encoding='utf-8') as f:
+                history = json.load(f)
+        else:
+            history = []
+        
+        # 获取当前K线数据作为特征
+        df = get_historical_data(ETH_SYMBOL, timeframe=TIMEFRAME, limit=100)
+        if df.empty:
+            return
+        
+        current = df.iloc[-1]
+        
+        # 记录信号
+        signal_record = {
+            'timestamp': datetime.now().isoformat(),
+            'signal_id': len(history) + 1,
+            'direction': signal.get('direction'),
+            'signal_strength': signal.get('signal_strength', 0),
+            'entry_price': signal.get('entry_price', 0),
+            'current_price': signal.get('current_price', 0),
+            'stop_loss': signal.get('stop_loss', 0),
+            'take_profit': signal.get('take_profit', 0),
+            'risk_reward_ratio': signal.get('risk_reward_ratio', 0),
+            # 技术指标特征
+            'rsi': float(current.get('rsi', 0)),
+            'macd': float(current.get('macd', 0)),
+            'macd_signal': float(current.get('macd_signal', 0)),
+            'macd_hist': float(current.get('macd_hist', 0)),
+            'ema7': float(current.get('ema7', 0)),
+            'ema14': float(current.get('ema14', 0)),
+            'ema21': float(current.get('ema21', 0)),
+            'ema50': float(current.get('ema50', 0)),
+            'vol_ratio': float(current.get('vol_ratio', 0)),
+            'atr_pct': float(current.get('atr_pct', 0)),
+            # 后续价格走势（待填充）
+            'future_prices': [],
+            'actual_result': None,  # 'WIN', 'LOSS', 'PENDING'
+            'max_profit_pct': 0,
+            'max_loss_pct': 0,
+            'final_pnl_pct': 0,
+            'evaluated': False
+        }
+        
+        history.append(signal_record)
+        
+        # 保存记录
+        with open(SIGNAL_HISTORY_FILE, 'w', encoding='utf-8') as f:
+            json.dump(history, f, indent=2, ensure_ascii=False)
+            
+    except Exception as e:
+        print(f"记录信号历史错误: {e}")
+
+# 更新信号历史（评估之前的信号质量）
+def evaluate_signal_history():
+    """评估历史信号的质量，更新实际结果"""
+    try:
+        if not os.path.exists(SIGNAL_HISTORY_FILE):
+            return
+        
+        with open(SIGNAL_HISTORY_FILE, 'r', encoding='utf-8') as f:
+            history = json.load(f)
+        
+        if not history:
+            return
+        
+        # 获取最新价格数据
+        df = get_historical_data(ETH_SYMBOL, timeframe=TIMEFRAME, limit=DL_PREDICTION_HORIZON + 10)
+        if df.empty:
+            return
+        
+        current_price = df.iloc[-1]['close']
+        current_time = datetime.now()
+        
+        updated = False
+        for record in history:
+            if record.get('evaluated', False):
+                continue
+            
+            signal_time = datetime.fromisoformat(record['timestamp'])
+            hours_passed = (current_time - signal_time).total_seconds() / 3600
+            
+            # 如果信号产生超过24小时，进行评估
+            if hours_passed >= DL_PREDICTION_HORIZON:
+                direction = record.get('direction')
+                entry_price = record.get('entry_price', 0)
+                stop_loss = record.get('stop_loss', 0)
+                take_profit = record.get('take_profit', 0)
+                
+                if entry_price == 0:
+                    continue
+                
+                # 获取信号产生后的价格走势
+                signal_idx = None
+                for i, row in df.iterrows():
+                    if abs((pd.to_datetime(row['timestamp']) - signal_time).total_seconds()) < 3600:
+                        signal_idx = i
+                        break
+                
+                if signal_idx is None:
+                    continue
+                
+                # 分析后续价格走势
+                future_prices = []
+                max_profit = 0
+                max_loss = 0
+                hit_stop_loss = False
+                hit_take_profit = False
+                
+                for i in range(signal_idx, min(signal_idx + DL_PREDICTION_HORIZON, len(df))):
+                    price = df.iloc[i]['close']
+                    future_prices.append(float(price))
+                    
+                    if direction == 'LONG':
+                        profit_pct = ((price - entry_price) / entry_price) * 100
+                        if price <= stop_loss:
+                            hit_stop_loss = True
+                        if price >= take_profit:
+                            hit_take_profit = True
+                    else:  # SHORT
+                        profit_pct = ((entry_price - price) / entry_price) * 100
+                        if price >= stop_loss:
+                            hit_stop_loss = True
+                        if price <= take_profit:
+                            hit_take_profit = True
+                    
+                    max_profit = max(max_profit, profit_pct)
+                    max_loss = min(max_loss, profit_pct)
+                
+                # 最终结果
+                final_price = future_prices[-1] if future_prices else current_price
+                if direction == 'LONG':
+                    final_pnl = ((final_price - entry_price) / entry_price) * 100
+                else:
+                    final_pnl = ((entry_price - final_price) / entry_price) * 100
+                
+                # 判断结果
+                if hit_stop_loss:
+                    actual_result = 'LOSS'
+                elif hit_take_profit:
+                    actual_result = 'WIN'
+                elif final_pnl > 0:
+                    actual_result = 'WIN'
+                else:
+                    actual_result = 'LOSS'
+                
+                # 更新记录
+                record['future_prices'] = future_prices
+                record['actual_result'] = actual_result
+                record['max_profit_pct'] = max_profit
+                record['max_loss_pct'] = max_loss
+                record['final_pnl_pct'] = final_pnl
+                record['evaluated'] = True
+                updated = True
+        
+        if updated:
+            with open(SIGNAL_HISTORY_FILE, 'w', encoding='utf-8') as f:
+                json.dump(history, f, indent=2, ensure_ascii=False)
+            print(f"✅ 已评估 {sum(1 for r in history if r.get('evaluated'))} 个历史信号")
+            
+    except Exception as e:
+        print(f"评估信号历史错误: {e}")
+        import traceback
+        traceback.print_exc()
+
+# 构建LSTM深度学习模型
+def build_lstm_model(input_shape):
+    """构建LSTM深度学习模型"""
+    if not TENSORFLOW_AVAILABLE:
+        return None
+    
+    try:
+        model = Sequential([
+            Input(shape=input_shape),
+            LSTM(128, return_sequences=True, dropout=0.2),
+            LSTM(64, return_sequences=False, dropout=0.2),
+            Dense(32, activation='relu'),
+            Dropout(0.3),
+            Dense(16, activation='relu'),
+            Dense(3, activation='softmax')  # 3个输出：LONG, SHORT, NEUTRAL的概率
+        ])
+        
+        model.compile(
+            optimizer=Adam(learning_rate=0.001),
+            loss='categorical_crossentropy',
+            metrics=['accuracy']
+        )
+        
+        return model
+    except Exception as e:
+        print(f"构建LSTM模型错误: {e}")
+        return None
+
+# 准备训练数据
+def prepare_training_data():
+    """从信号历史中准备训练数据"""
+    try:
+        if not os.path.exists(SIGNAL_HISTORY_FILE):
+            return None, None
+        
+        with open(SIGNAL_HISTORY_FILE, 'r', encoding='utf-8') as f:
+            history = json.load(f)
+        
+        # 只使用已评估的信号
+        evaluated_signals = [r for r in history if r.get('evaluated', False)]
+        
+        if len(evaluated_signals) < DL_MIN_SIGNALS_FOR_TRAIN:
+            return None, None
+        
+        # 获取历史K线数据
+        df = get_historical_data(ETH_SYMBOL, timeframe=TIMEFRAME, limit=500)
+        if df.empty:
+            return None, None
+        
+        X_sequences = []
+        y_labels = []
+        
+        for signal in evaluated_signals:
+            try:
+                signal_time = datetime.fromisoformat(signal['timestamp'])
+                
+                # 找到信号产生时的K线索引
+                signal_idx = None
+                for i, row in df.iterrows():
+                    if abs((pd.to_datetime(row['timestamp']) - signal_time).total_seconds()) < 3600:
+                        signal_idx = i
+                        break
+                
+                if signal_idx is None or signal_idx < DL_SEQUENCE_LENGTH:
+                    continue
+                
+                # 提取序列特征（使用信号产生前60根K线）
+                sequence = []
+                for j in range(signal_idx - DL_SEQUENCE_LENGTH, signal_idx):
+                    row = df.iloc[j]
+                    features = [
+                        float(row.get('close', 0)),
+                        float(row.get('rsi', 0)),
+                        float(row.get('macd', 0)),
+                        float(row.get('macd_hist', 0)),
+                        float(row.get('ema7', 0)),
+                        float(row.get('ema14', 0)),
+                        float(row.get('ema21', 0)),
+                        float(row.get('ema50', 0)),
+                        float(row.get('vol_ratio', 0)),
+                        float(row.get('atr_pct', 0)),
+                    ]
+                    sequence.append(features)
+                
+                if len(sequence) == DL_SEQUENCE_LENGTH:
+                    X_sequences.append(sequence)
+                    
+                    # 标签：根据实际结果
+                    result = signal.get('actual_result', 'LOSS')
+                    direction = signal.get('direction', 'NEUTRAL')
+                    
+                    # 如果信号正确，使用原方向；如果错误，使用相反方向或NEUTRAL
+                    if result == 'WIN':
+                        if direction == 'LONG':
+                            y_labels.append([1, 0, 0])  # LONG
+                        else:
+                            y_labels.append([0, 1, 0])  # SHORT
+                    else:  # LOSS
+                        # 错误信号，标记为NEUTRAL或相反方向
+                        y_labels.append([0, 0, 1])  # NEUTRAL
+                        
+            except Exception as e:
+                continue
+        
+        if len(X_sequences) < 10:
+            return None, None
+        
+        X = np.array(X_sequences)
+        y = np.array(y_labels)
+        
+        return X, y
+        
+    except Exception as e:
+        print(f"准备训练数据错误: {e}")
+        import traceback
+        traceback.print_exc()
+        return None, None
+
+# 训练深度学习模型
+def train_deep_learning_model():
+    """训练LSTM深度学习模型"""
+    if not TENSORFLOW_AVAILABLE:
+        print("⚠️ TensorFlow未安装，跳过深度学习模型训练")
+        return None
+    
+    try:
+        print("🔄 开始训练深度学习模型...")
+        
+        # 准备数据
+        X, y = prepare_training_data()
+        if X is None or y is None:
+            print("⚠️ 训练数据不足，跳过训练")
+            return None
+        
+        print(f"📊 训练数据: {len(X)} 个样本")
+        
+        # 数据标准化
+        scaler = MinMaxScaler()
+        n_samples, n_timesteps, n_features = X.shape
+        X_reshaped = X.reshape(-1, n_features)
+        X_scaled = scaler.fit_transform(X_reshaped)
+        X_scaled = X_scaled.reshape(n_samples, n_timesteps, n_features)
+        
+        # 保存scaler
+        joblib.dump(scaler, DL_SCALER_PATH)
+        
+        # 构建模型
+        input_shape = (n_timesteps, n_features)
+        model = build_lstm_model(input_shape)
+        
+        if model is None:
+            return None
+        
+        # 训练模型
+        early_stopping = EarlyStopping(monitor='loss', patience=10, restore_best_weights=True)
+        model_checkpoint = ModelCheckpoint(DL_MODEL_PATH, save_best_only=True, monitor='loss')
+        
+        history = model.fit(
+            X_scaled, y,
+            epochs=50,
+            batch_size=32,
+            validation_split=0.2,
+            verbose=1,
+            callbacks=[early_stopping, model_checkpoint]
+        )
+        
+        print(f"✅ 深度学习模型训练完成，准确率: {max(history.history['accuracy']):.2%}")
+        return model
+        
+    except Exception as e:
+        print(f"训练深度学习模型错误: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+# 使用深度学习模型预测
+def predict_with_dl_model(df):
+    """使用深度学习模型预测交易方向"""
+    if not TENSORFLOW_AVAILABLE:
+        return None
+    
+    try:
+        # 加载模型
+        if not os.path.exists(DL_MODEL_PATH):
+            return None
+        
+        model = load_model(DL_MODEL_PATH)
+        
+        # 加载scaler
+        if not os.path.exists(DL_SCALER_PATH):
+            return None
+        
+        scaler = joblib.load(DL_SCALER_PATH)
+        
+        # 准备输入数据（最近60根K线）
+        if len(df) < DL_SEQUENCE_LENGTH:
+            return None
+        
+        sequence = []
+        for i in range(len(df) - DL_SEQUENCE_LENGTH, len(df)):
+            row = df.iloc[i]
+            features = [
+                float(row.get('close', 0)),
+                float(row.get('rsi', 0)),
+                float(row.get('macd', 0)),
+                float(row.get('macd_hist', 0)),
+                float(row.get('ema7', 0)),
+                float(row.get('ema14', 0)),
+                float(row.get('ema21', 0)),
+                float(row.get('ema50', 0)),
+                float(row.get('vol_ratio', 0)),
+                float(row.get('atr_pct', 0)),
+            ]
+            sequence.append(features)
+        
+        X = np.array([sequence])
+        
+        # 标准化
+        n_samples, n_timesteps, n_features = X.shape
+        X_reshaped = X.reshape(-1, n_features)
+        X_scaled = scaler.transform(X_reshaped)
+        X_scaled = X_scaled.reshape(n_samples, n_timesteps, n_features)
+        
+        # 预测
+        predictions = model.predict(X_scaled, verbose=0)
+        probs = predictions[0]  # [LONG概率, SHORT概率, NEUTRAL概率]
+        
+        return {
+            'long_prob': float(probs[0]),
+            'short_prob': float(probs[1]),
+            'neutral_prob': float(probs[2]),
+            'predicted_direction': 'LONG' if probs[0] > probs[1] and probs[0] > 0.5 else 
+                                  'SHORT' if probs[1] > probs[0] and probs[1] > 0.5 else 'NEUTRAL',
+            'confidence': float(max(probs))
+        }
+        
+    except Exception as e:
+        print(f"深度学习预测错误: {e}")
+        return None
+
+# 自我修正交易算法
+def self_correct_trading_algorithm():
+    """根据历史信号表现，自我修正交易算法参数"""
+    try:
+        if not os.path.exists(SIGNAL_HISTORY_FILE):
+            return
+        
+        with open(SIGNAL_HISTORY_FILE, 'r', encoding='utf-8') as f:
+            history = json.load(f)
+        
+        evaluated_signals = [r for r in history if r.get('evaluated', False)]
+        
+        if len(evaluated_signals) < 20:
+            return
+        
+        # 分析信号表现
+        win_count = sum(1 for s in evaluated_signals if s.get('actual_result') == 'WIN')
+        loss_count = sum(1 for s in evaluated_signals if s.get('actual_result') == 'LOSS')
+        total = len(evaluated_signals)
+        win_rate = win_count / total if total > 0 else 0
+        
+        # 分析不同信号强度的表现
+        strength_performance = {}
+        for signal in evaluated_signals:
+            strength = int(signal.get('signal_strength', 0) // 10) * 10  # 按10分区间分组
+            if strength not in strength_performance:
+                strength_performance[strength] = {'win': 0, 'loss': 0}
+            
+            if signal.get('actual_result') == 'WIN':
+                strength_performance[strength]['win'] += 1
+            else:
+                strength_performance[strength]['loss'] += 1
+        
+        # 找出表现最好的信号强度区间
+        best_threshold = SIGNAL_THRESHOLD
+        best_win_rate = 0
+        
+        for strength, perf in strength_performance.items():
+            total_strength = perf['win'] + perf['loss']
+            if total_strength >= 5:  # 至少5个样本
+                strength_win_rate = perf['win'] / total_strength
+                if strength_win_rate > best_win_rate:
+                    best_win_rate = strength_win_rate
+                    best_threshold = strength
+        
+        # 如果发现更好的阈值，建议调整
+        global SIGNAL_THRESHOLD
+        if best_threshold != SIGNAL_THRESHOLD and best_win_rate > win_rate + 0.1:
+            old_threshold = SIGNAL_THRESHOLD
+            SIGNAL_THRESHOLD = max(70, min(90, best_threshold))  # 限制在70-90之间
+            
+            correction_msg = f"🧠 <b>算法自我修正</b>\n\n" \
+                           f"历史信号分析:\n" \
+                           f"总信号数: {total}\n" \
+                           f"胜率: {win_rate:.1%}\n" \
+                           f"最佳信号强度阈值: {best_threshold} (胜率: {best_win_rate:.1%})\n\n" \
+                           f"建议调整:\n" \
+                           f"信号阈值: {old_threshold} → {SIGNAL_THRESHOLD}"
+            
+            log(correction_msg, send_to_telegram=True)
+            print(f"🧠 算法自我修正: 信号阈值 {old_threshold} → {SIGNAL_THRESHOLD}")
+        
+    except Exception as e:
+        print(f"自我修正算法错误: {e}")
 
 # 获取历史数据并计算所有技术指标
 def get_historical_data(symbol, timeframe=None, limit=500):
@@ -548,9 +1067,27 @@ def analyze_eth_advanced():
         if not best_entry:
             return None
         
-        # 计算综合信号强度
-        signal_strength = ma_analysis['score'] + pattern_score
-        signal_strength = min(signal_strength, 100)
+        # 3. 深度学习模型预测（如果可用）
+        dl_prediction = None
+        dl_adjustment = 0
+        if TENSORFLOW_AVAILABLE:
+            dl_prediction = predict_with_dl_model(df_1h)
+            if dl_prediction:
+                # 如果深度学习预测与主方向一致，增加信号强度
+                if dl_prediction['predicted_direction'] == main_direction:
+                    dl_adjustment = dl_prediction['confidence'] * 20  # 最高增加20分
+                    pattern_signals.append(f"🤖 深度学习确认: {dl_prediction['predicted_direction']} (置信度: {dl_prediction['confidence']:.1%})")
+                elif dl_prediction['predicted_direction'] == 'NEUTRAL':
+                    dl_adjustment = -10  # 深度学习建议观望，降低信号强度
+                    pattern_signals.append(f"🤖 深度学习建议: 观望 (置信度: {dl_prediction['neutral_prob']:.1%})")
+                else:
+                    # 深度学习预测相反方向，大幅降低信号强度
+                    dl_adjustment = -30
+                    pattern_signals.append(f"⚠️ 深度学习警告: 预测方向相反 ({dl_prediction['predicted_direction']})")
+        
+        # 计算综合信号强度（结合深度学习）
+        signal_strength = ma_analysis['score'] + pattern_score + dl_adjustment
+        signal_strength = max(0, min(signal_strength, 100))  # 限制在0-100之间
         
         if signal_strength < SIGNAL_THRESHOLD:
             return None
@@ -570,6 +1107,7 @@ def analyze_eth_advanced():
             'all_fvg_entries': best_entry_points,
             'rsi': df_1h.iloc[-1]['rsi'],
             'macd_hist': df_1h.iloc[-1]['macd_hist'],
+            'dl_prediction': dl_prediction,  # 添加深度学习预测结果
         }
         
         return signal
@@ -867,43 +1405,488 @@ def log(message, send_to_telegram=True):
     if send_to_telegram:
         send_telegram(log_message)
 
+# 设置杠杆
+def set_leverage(symbol, leverage):
+    """设置合约杠杆"""
+    try:
+        exchange.set_leverage(leverage, symbol)
+        print(f"✅ 设置{symbol}杠杆为{leverage}x")
+        return True
+    except Exception as e:
+        print(f"⚠️ 设置杠杆失败: {e}（可能已设置或测试网不支持）")
+        return False
+
 # 查询当前情况
 def check_status():
-    balance = exchange.fetch_balance()['USDT']['total']
-    positions = exchange.fetch_positions()
-    status_message = f"📈 <b>账户状态</b>\n\n" \
-                    f"当前余额: {balance:.2f} USDT\n"
-    if positions:
-        status_message += "持仓:\n"
-        for pos in positions:
-            if float(pos['contracts']) > 0:
-                status_message += f"  • {pos['symbol']} {pos['side']} {pos['contracts']} 合约\n"
-    else:
-        status_message += "无持仓"
-    log(status_message)
-    # 读取最后10行日志
-    with open(LOG_FILE, 'r', encoding='utf-8') as f:
-        logs = f.readlines()[-10:]
-        print("最近日志:\n" + ''.join(logs))
+    try:
+        # 合约账户余额
+        balance = exchange.fetch_balance({'type': 'future'})
+        usdt_balance = balance.get('USDT', {}).get('total', 0)
+        usdt_free = balance.get('USDT', {}).get('free', 0)
+        
+        status_message = f"📈 <b>合约账户状态</b>\n\n" \
+                        f"USDT总余额: {usdt_balance:.2f} USDT\n" \
+                        f"USDT可用余额: {usdt_free:.2f} USDT\n"
+        
+        # 获取当前持仓（合约）
+        positions = exchange.fetch_positions([ETH_SYMBOL])
+        active_positions = [pos for pos in positions if float(pos.get('contracts', 0)) != 0]
+        
+        if active_positions:
+            status_message += f"\n<b>当前持仓:</b>\n"
+            for pos in active_positions:
+                side = pos.get('side', 'unknown')
+                contracts = float(pos.get('contracts', 0))
+                entry_price = float(pos.get('entryPrice', 0))
+                mark_price = float(pos.get('markPrice', 0))
+                unrealized_pnl = float(pos.get('unrealizedPnl', 0))
+                percentage = float(pos.get('percentage', 0))
+                leverage = pos.get('leverage', 1)
+                
+                status_message += f"  {side.upper()}: {abs(contracts)} 张\n"
+                status_message += f"  开仓价: {entry_price:.2f} USDT\n"
+                status_message += f"  标记价: {mark_price:.2f} USDT\n"
+                status_message += f"  杠杆: {leverage}x\n"
+                status_message += f"  未实现盈亏: {unrealized_pnl:+.2f} USDT ({percentage:+.2f}%)\n"
+        else:
+            status_message += "\n无持仓\n"
+            
+        log(status_message)
+        # 读取最后10行日志
+        try:
+            with open(LOG_FILE, 'r', encoding='utf-8') as f:
+                logs = f.readlines()[-10:]
+                print("最近日志:\n" + ''.join(logs))
+        except:
+            pass
+    except Exception as e:
+        print(f"查询状态错误: {e}")
+        import traceback
+        traceback.print_exc()
+
+# 获取当前持仓
+def get_current_position():
+    """获取当前ETH合约持仓，并从交易记录中读取开仓信息"""
+    try:
+        import json
+        import os
+        
+        # 获取合约持仓
+        positions = exchange.fetch_positions([ETH_SYMBOL])
+        active_positions = [pos for pos in positions if float(pos.get('contracts', 0)) != 0]
+        
+        current_price = exchange.fetch_ticker(ETH_SYMBOL)['last']
+        
+        if active_positions:
+            # 有持仓
+            pos = active_positions[0]  # 取第一个持仓
+            side = pos.get('side', 'long').upper()
+            contracts = float(pos.get('contracts', 0))
+            entry_price = float(pos.get('entryPrice', current_price))
+            mark_price = float(pos.get('markPrice', current_price))
+            
+            # 从交易记录中查找止损止盈
+            stop_loss = entry_price * (1 - STOP_LOSS_PCT) if side == 'LONG' else entry_price * (1 + STOP_LOSS_PCT)
+            take_profit = entry_price * (1 + TAKE_PROFIT_PCT) if side == 'LONG' else entry_price * (1 - TAKE_PROFIT_PCT)
+            
+            if os.path.exists(TRADE_RECORD_FILE):
+                try:
+                    with open(TRADE_RECORD_FILE, 'r', encoding='utf-8') as f:
+                        records = json.load(f)
+                    # 查找最近的开仓记录
+                    action_prefix = 'OPEN_LONG' if side == 'LONG' else 'OPEN_SHORT'
+                    open_records = [r for r in records if r.get('action') == action_prefix]
+                    close_action = 'CLOSE_LONG' if side == 'LONG' else 'CLOSE_SHORT'
+                    close_records = [r for r in records if r.get('action') == close_action]
+                    # 如果开仓记录数大于平仓记录数，说明有持仓
+                    if len(open_records) > len(close_records):
+                        last_open = open_records[len(close_records)]
+                        entry_price = last_open.get('entry_price', entry_price)
+                        stop_loss = last_open.get('stop_loss', stop_loss)
+                        take_profit = last_open.get('take_profit', take_profit)
+                except:
+                    pass
+            
+            return {
+                'side': side,
+                'contracts': abs(contracts),
+                'entry_price': entry_price,
+                'stop_loss': stop_loss,
+                'take_profit': take_profit,
+                'current_price': mark_price,
+                'unrealized_pnl': float(pos.get('unrealizedPnl', 0)),
+                'percentage': float(pos.get('percentage', 0)),
+                'leverage': pos.get('leverage', 1)
+            }
+        else:
+            # 无持仓
+            return {
+                'side': 'NONE',
+                'contracts': 0,
+                'entry_price': 0,
+                'stop_loss': 0,
+                'take_profit': 0,
+                'current_price': current_price,
+                'unrealized_pnl': 0,
+                'percentage': 0,
+                'leverage': 0
+            }
+    except Exception as e:
+        print(f"获取持仓错误: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+# 执行交易
+def execute_trade(signal):
+    """根据信号执行合约交易"""
+    if not AUTO_TRADE_ENABLED:
+        print("⚠️ 自动交易已禁用，仅监控模式")
+        return False
+    
+    try:
+        direction = signal['direction']
+        entry_price = signal['entry_price']
+        stop_loss = signal['stop_loss']
+        take_profit = signal['take_profit']
+        current_price = signal['current_price']
+        
+        # 设置杠杆
+        leverage = LEVERAGE.get(direction, 3)
+        set_leverage(ETH_SYMBOL, leverage)
+        
+        # 检查当前持仓
+        position = get_current_position()
+        
+        # 如果已有同向持仓，不重复开仓
+        if position and position['side'] == direction:
+            print(f"⚠️ 已有{direction}持仓，跳过开仓")
+            return False
+        
+        # 如果有反向持仓，先平仓
+        if position and position['side'] != 'NONE' and position['side'] != direction:
+            print(f"🔄 检测到反向持仓，先平仓...")
+            close_position(position)
+            time.sleep(2)  # 等待订单完成
+        
+        # 获取合约账户余额
+        balance = exchange.fetch_balance({'type': 'future'})
+        usdt_balance = balance.get('USDT', {}).get('free', 0)
+        
+        if usdt_balance < 10:  # 最少需要10 USDT
+            print(f"❌ USDT余额不足: {usdt_balance:.2f} USDT")
+            return False
+        
+        # 计算开仓金额（使用80%的可用余额）
+        trade_amount_usdt = usdt_balance * 0.8
+        
+        # 获取交易对信息
+        market = exchange.market(ETH_SYMBOL)
+        contract_size = float(market.get('contractSize', 1))  # 合约面值
+        amount_precision = market['precision']['amount']
+        
+        # 计算合约数量（考虑杠杆）
+        # 合约数量 = (开仓金额 * 杠杆) / (当前价格 * 合约面值)
+        contracts = (trade_amount_usdt * leverage) / (current_price * contract_size)
+        contracts = round(contracts, amount_precision)
+        
+        if contracts < market['limits']['amount']['min']:
+            print(f"❌ 合约数量太小: {contracts} 张")
+            return False
+        
+        # 执行开仓
+        side = 'buy' if direction == 'LONG' else 'sell'
+        print(f"🔄 执行开仓: {direction} {contracts} 张 @ {current_price:.2f} USDT (杠杆{leverage}x)")
+        
+        order = exchange.create_market_order(
+            ETH_SYMBOL,
+            side,
+            contracts,
+            None,  # 市价单不需要价格
+            None,  # 默认参数
+            {
+                'leverage': leverage,
+                'positionSide': 'BOTH'  # 单向持仓模式
+            }
+        )
+        
+        # 记录交易
+        record_trade({
+            'action': f'OPEN_{direction}',
+            'symbol': ETH_SYMBOL,
+            'contracts': contracts,
+            'price': current_price,
+            'entry_price': entry_price,
+            'stop_loss': stop_loss,
+            'take_profit': take_profit,
+            'leverage': leverage,
+            'signal_strength': signal['signal_strength'],
+            'risk_reward_ratio': signal['risk_reward_ratio'],
+            'order_id': order.get('id'),
+            'timestamp': datetime.now().isoformat()
+        })
+        
+        trade_msg = f"✅ <b>开仓成功 - {direction} ETH合约</b>\n\n" \
+                   f"方向: {direction}\n" \
+                   f"合约数量: {contracts} 张\n" \
+                   f"开仓价格: {current_price:.2f} USDT\n" \
+                   f"杠杆: {leverage}x\n" \
+                   f"止损: {stop_loss:.2f} USDT\n" \
+                   f"止盈: {take_profit:.2f} USDT\n" \
+                   f"信号强度: {signal['signal_strength']:.1f}/100\n" \
+                   f"盈亏比: {signal['risk_reward_ratio']:.2f}:1"
+        log(trade_msg)
+        return True
+            
+    except Exception as e:
+        error_msg = f"❌ 执行交易错误: {e}"
+        print(error_msg)
+        import traceback
+        traceback.print_exc()
+        log(error_msg, send_to_telegram=False)
+        return False
+
+# 平仓
+def close_position(position):
+    """平仓当前合约持仓"""
+    try:
+        if not position or position['side'] == 'NONE':
+            return False
+        
+        contracts = position['contracts']
+        side = position['side']
+        entry_price = position['entry_price']
+        current_price = position['current_price']
+        unrealized_pnl = position.get('unrealized_pnl', 0)
+        percentage = position.get('percentage', 0)
+        
+        # 获取交易对信息
+        market = exchange.market(ETH_SYMBOL)
+        amount_precision = market['precision']['amount']
+        contracts = round(contracts, amount_precision)
+        
+        # 平仓方向：做多平仓用sell，做空平仓用buy
+        close_side = 'sell' if side == 'LONG' else 'buy'
+        
+        print(f"🔄 平仓: {side} {contracts} 张 @ {current_price:.2f} USDT")
+        
+        # 执行平仓（使用reduceOnly确保只平仓不开新仓）
+        order = exchange.create_market_order(
+            ETH_SYMBOL,
+            close_side,
+            contracts,
+            None,  # 市价单
+            None,
+            {
+                'reduceOnly': True,  # 只减仓标志
+                'positionSide': 'BOTH'
+            }
+        )
+        
+        # 计算盈亏
+        if side == 'LONG':
+            pnl = (current_price - entry_price) * contracts * market.get('contractSize', 1)
+        else:
+            pnl = (entry_price - current_price) * contracts * market.get('contractSize', 1)
+        
+        record_trade({
+            'action': f'CLOSE_{side}',
+            'symbol': ETH_SYMBOL,
+            'contracts': contracts,
+            'price': current_price,
+            'entry_price': entry_price,
+            'pnl': unrealized_pnl,  # 使用实际的未实现盈亏
+            'pnl_pct': percentage,
+            'order_id': order.get('id'),
+            'timestamp': datetime.now().isoformat()
+        })
+        
+        close_msg = f"✅ <b>平仓成功</b>\n\n" \
+                   f"方向: {side}\n" \
+                   f"合约数量: {contracts} 张\n" \
+                   f"平仓价格: {current_price:.2f} USDT\n" \
+                   f"开仓价格: {entry_price:.2f} USDT\n" \
+                   f"盈亏: {unrealized_pnl:+.2f} USDT ({percentage:+.2f}%)"
+        log(close_msg)
+        return True
+            
+    except Exception as e:
+        error_msg = f"❌ 平仓错误: {e}"
+        print(error_msg)
+        import traceback
+        traceback.print_exc()
+        log(error_msg, send_to_telegram=False)
+        return False
+
+# 检查止损止盈
+def check_stop_loss_take_profit():
+    """检查当前持仓是否触发止损或止盈"""
+    try:
+        position = get_current_position()
+        if not position or position['side'] == 'NONE':
+            return
+        
+        current_price = position['current_price']
+        stop_loss_price = position.get('stop_loss', 0)
+        take_profit_price = position.get('take_profit', 0)
+        side = position['side']
+        
+        if side == 'LONG':
+            # 做多：价格下跌触发止损，价格上涨触发止盈
+            if stop_loss_price > 0 and current_price <= stop_loss_price:
+                print(f"🛑 触发止损: {current_price:.2f} <= {stop_loss_price:.2f}")
+                close_position(position)
+                log(f"🛑 <b>止损触发，已平仓</b>\n\n"
+                    f"方向: {side}\n"
+                    f"平仓价格: {current_price:.2f} USDT\n"
+                    f"止损价格: {stop_loss_price:.2f} USDT\n"
+                    f"开仓价格: {position['entry_price']:.2f} USDT\n"
+                    f"盈亏: {position.get('unrealized_pnl', 0):+.2f} USDT", send_to_telegram=True)
+            elif take_profit_price > 0 and current_price >= take_profit_price:
+                print(f"🎯 触发止盈: {current_price:.2f} >= {take_profit_price:.2f}")
+                close_position(position)
+                log(f"🎯 <b>止盈触发，已平仓</b>\n\n"
+                    f"方向: {side}\n"
+                    f"平仓价格: {current_price:.2f} USDT\n"
+                    f"止盈价格: {take_profit_price:.2f} USDT\n"
+                    f"开仓价格: {position['entry_price']:.2f} USDT\n"
+                    f"盈亏: {position.get('unrealized_pnl', 0):+.2f} USDT", send_to_telegram=True)
+        elif side == 'SHORT':
+            # 做空：价格上涨触发止损，价格下跌触发止盈
+            if stop_loss_price > 0 and current_price >= stop_loss_price:
+                print(f"🛑 触发止损: {current_price:.2f} >= {stop_loss_price:.2f}")
+                close_position(position)
+                log(f"🛑 <b>止损触发，已平仓</b>\n\n"
+                    f"方向: {side}\n"
+                    f"平仓价格: {current_price:.2f} USDT\n"
+                    f"止损价格: {stop_loss_price:.2f} USDT\n"
+                    f"开仓价格: {position['entry_price']:.2f} USDT\n"
+                    f"盈亏: {position.get('unrealized_pnl', 0):+.2f} USDT", send_to_telegram=True)
+            elif take_profit_price > 0 and current_price <= take_profit_price:
+                print(f"🎯 触发止盈: {current_price:.2f} <= {take_profit_price:.2f}")
+                close_position(position)
+                log(f"🎯 <b>止盈触发，已平仓</b>\n\n"
+                    f"方向: {side}\n"
+                    f"平仓价格: {current_price:.2f} USDT\n"
+                    f"止盈价格: {take_profit_price:.2f} USDT\n"
+                    f"开仓价格: {position['entry_price']:.2f} USDT\n"
+                    f"盈亏: {position.get('unrealized_pnl', 0):+.2f} USDT", send_to_telegram=True)
+                
+    except Exception as e:
+        print(f"检查止损止盈错误: {e}")
+
+# 记录交易
+def record_trade(trade_data):
+    """记录交易到文件"""
+    try:
+        import json
+        import os
+        
+        # 读取现有记录
+        if os.path.exists(TRADE_RECORD_FILE):
+            with open(TRADE_RECORD_FILE, 'r', encoding='utf-8') as f:
+                records = json.load(f)
+        else:
+            records = []
+        
+        # 添加新记录
+        records.append(trade_data)
+        
+        # 保存记录
+        with open(TRADE_RECORD_FILE, 'w', encoding='utf-8') as f:
+            json.dump(records, f, indent=2, ensure_ascii=False)
+            
+    except Exception as e:
+        print(f"记录交易错误: {e}")
+
+# 获取交易统计
+def get_trade_statistics():
+    """获取交易统计信息"""
+    try:
+        import json
+        import os
+        
+        if not os.path.exists(TRADE_RECORD_FILE):
+            return None
+        
+        with open(TRADE_RECORD_FILE, 'r', encoding='utf-8') as f:
+            records = json.load(f)
+        
+        if not records:
+            return None
+        
+        # 统计
+        total_trades = len(records)
+        closed_trades = [r for r in records if r.get('action', '').startswith('CLOSE')]
+        total_pnl = sum([r.get('pnl', 0) for r in closed_trades])
+        winning_trades = len([r for r in closed_trades if r.get('pnl', 0) > 0])
+        losing_trades = len([r for r in closed_trades if r.get('pnl', 0) < 0])
+        win_rate = (winning_trades / len(closed_trades) * 100) if closed_trades else 0
+        
+        return {
+            'total_trades': total_trades,
+            'closed_trades': len(closed_trades),
+            'winning_trades': winning_trades,
+            'losing_trades': losing_trades,
+            'win_rate': win_rate,
+            'total_pnl': total_pnl
+        }
+    except Exception as e:
+        print(f"获取交易统计错误: {e}")
+        return None
 
 # ETH实时监控函数（使用高级分析）
 def monitor_eth():
-    """实时监控ETH走势，使用均线+形态+FVG分析，发现交易机会时发送通知"""
+    """实时监控ETH走势，使用均线+形态+FVG+深度学习分析，发现交易机会时自动交易"""
     try:
-        # 使用高级分析（均线+形态+FVG）
+        # 1. 先检查当前持仓的止损止盈
+        check_stop_loss_take_profit()
+        
+        # 2. 评估历史信号（更新信号质量）
+        evaluate_signal_history()
+        
+        # 3. 使用高级分析（均线+形态+FVG+深度学习）
         signal = analyze_eth_advanced()
         
         if signal:
-            # 发现强信号，发送详细通知
-            send_trading_signal(signal)
+            # 发现强信号
             print(f"✅ 发现ETH交易信号: {signal['direction']}, 强度: {signal['signal_strength']:.1f}, "
                   f"入场: {signal['entry_price']:.2f}, 盈亏比: {signal['risk_reward_ratio']:.2f}:1")
+            
+            # 记录信号历史（用于深度学习）
+            record_signal_history(signal)
+            
+            # 检查是否需要训练模型（每100个新信号后）
+            if os.path.exists(SIGNAL_HISTORY_FILE):
+                with open(SIGNAL_HISTORY_FILE, 'r', encoding='utf-8') as f:
+                    history = json.load(f)
+                if len(history) % DL_TRAIN_INTERVAL == 0 and len(history) >= DL_MIN_SIGNALS_FOR_TRAIN:
+                    print(f"🔄 检测到{len(history)}个信号，开始训练深度学习模型...")
+                    train_deep_learning_model()
+            
+            # 发送详细通知
+            send_trading_signal(signal)
+            
+            # 如果启用自动交易，执行交易
+            if AUTO_TRADE_ENABLED:
+                print("🤖 自动交易已启用，准备执行交易...")
+                execute_trade(signal)
+            else:
+                print("⚠️ 自动交易已禁用，仅发送信号通知")
         else:
             # 无强信号，仅记录日志（不发送Telegram）
             try:
                 current_price = exchange.fetch_ticker(ETH_SYMBOL)['last']
+                position = get_current_position()
+                position_info = ""
+                if position and position['side'] != 'NONE':
+                    pnl_pct = position.get('percentage', 0)
+                    unrealized_pnl = position.get('unrealized_pnl', 0)
+                    contracts = position.get('contracts', 0)
+                    position_info = f" | 持仓: {position['side']} {contracts}张 | 盈亏: {unrealized_pnl:+.2f} USDT ({pnl_pct:+.2f}%)"
+                
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                log_message = f"[{timestamp}] ETH监控中... 当前价格: {current_price:.2f} USDT (无强信号)"
+                log_message = f"[{timestamp}] ETH监控中... 当前价格: {current_price:.2f} USDT (无强信号){position_info}"
                 print(log_message)
                 with open(LOG_FILE, 'a', encoding='utf-8') as f:
                     f.write(log_message + "\n")
@@ -966,6 +1949,16 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         if sys.argv[1] == "--check":
             check_status()
+            # 显示交易统计
+            stats = get_trade_statistics()
+            if stats:
+                print(f"\n📊 交易统计:")
+                print(f"总交易次数: {stats['total_trades']}")
+                print(f"已平仓次数: {stats['closed_trades']}")
+                print(f"盈利次数: {stats['winning_trades']}")
+                print(f"亏损次数: {stats['losing_trades']}")
+                print(f"胜率: {stats['win_rate']:.2f}%")
+                print(f"总盈亏: {stats['total_pnl']:+.2f} USDT")
         elif sys.argv[1] == "--test-telegram":
             test_telegram()
         elif sys.argv[1] == "--analyze-eth":
@@ -975,23 +1968,55 @@ if __name__ == "__main__":
             if signal:
                 send_trading_signal(signal)
                 print(f"✅ 发现信号: {signal['direction']}, 强度: {signal['signal_strength']:.1f}")
+                if AUTO_TRADE_ENABLED:
+                    print("🤖 自动交易已启用，准备执行...")
+                    execute_trade(signal)
             else:
                 print("当前无强交易信号")
         elif sys.argv[1] == "--analyze-all":
             # 分析所有币种
             analyze_all_coins()
+        elif sys.argv[1] == "--stats":
+            # 显示交易统计
+            stats = get_trade_statistics()
+            if stats:
+                stats_msg = f"📊 <b>交易统计</b>\n\n" \
+                           f"总交易次数: {stats['total_trades']}\n" \
+                           f"已平仓次数: {stats['closed_trades']}\n" \
+                           f"盈利次数: {stats['winning_trades']}\n" \
+                           f"亏损次数: {stats['losing_trades']}\n" \
+                           f"胜率: {stats['win_rate']:.2f}%\n" \
+                           f"总盈亏: {stats['total_pnl']:+.2f} USDT"
+                log(stats_msg)
+            else:
+                print("暂无交易记录")
     else:
         # 启动实时监控
-        startup_message = "🤖 <b>ETH AI交易机器人启动</b>\n\n" \
-                         f"🎯 专注币种: ETH\n" \
+        trade_mode = "🤖 自动交易模式" if AUTO_TRADE_ENABLED else "👁️ 仅监控模式（不执行实际交易）"
+        startup_message = f"🤖 <b>ETH AI合约交易机器人启动</b>\n\n" \
+                         f"{trade_mode}\n" \
+                         f"📈 交易类型: 永续合约\n" \
+                         f"🎯 专注币种: ETH/USDT:USDT\n" \
                          f"📊 监控币种: {', '.join(COINS)}\n" \
                          f"⏱️ 时间周期: {TIMEFRAME}\n" \
+                         f"⚡ 杠杆倍数: {LEVERAGE['LONG']}x (做多/做空)\n" \
                          f"📈 信号阈值: {SIGNAL_THRESHOLD}/100\n" \
                          f"💰 止损: {STOP_LOSS_PCT*100:.1f}% | 止盈: {TAKE_PROFIT_PCT*100:.1f}%\n" \
                          f"🔄 监控间隔: {MONITOR_INTERVAL//60}分钟\n" \
                          f"━━━━━━━━━━━━━━━━━━━━\n" \
-                         f"✅ 机器人已启动，开始实时监控ETH走势..."
+                         f"⚠️ <b>当前为仅监控模式，不会执行实际交易</b>\n" \
+                         f"✅ 机器人已启动，开始实时监控ETH合约走势并发送信号..."
         log(startup_message)
+        
+        # 显示当前账户状态
+        check_status()
+        
+        # 显示交易统计（如果有）
+        stats = get_trade_statistics()
+        if stats:
+            print(f"\n📊 历史交易统计:")
+            print(f"总交易次数: {stats['total_trades']} | 已平仓: {stats['closed_trades']}")
+            print(f"胜率: {stats['win_rate']:.2f}% | 总盈亏: {stats['total_pnl']:+.2f} USDT\n")
         
         # 立即执行一次分析
         monitor_eth()
@@ -999,11 +2024,57 @@ if __name__ == "__main__":
         # 定时任务：每5分钟监控一次ETH
         schedule.every(MONITOR_INTERVAL // 60).minutes.do(monitor_eth)
         
+        # 每1分钟检查一次止损止盈（更频繁检查）
+        schedule.every(1).minutes.do(check_stop_loss_take_profit)
+        
+        # 每小时显示一次账户状态
+        schedule.every().hour.do(check_status)
+        
         # 每天分析一次所有币种（可选）
         schedule.every().day.at("09:00").do(analyze_all_coins)
         
-        print(f"\n✅ 机器人运行中... 每{MONITOR_INTERVAL//60}分钟检查一次ETH信号")
-        print("按 Ctrl+C 停止\n")
+        # 每天显示交易统计
+        schedule.every().day.at("20:00").do(lambda: (
+            stats := get_trade_statistics(),
+            stats and log(f"📊 <b>每日交易统计</b>\n\n"
+                         f"总交易: {stats['total_trades']} | 已平仓: {stats['closed_trades']}\n"
+                         f"胜率: {stats['win_rate']:.2f}% | 总盈亏: {stats['total_pnl']:+.2f} USDT")
+        ))
+        
+        # 每天凌晨2点训练深度学习模型（如果数据足够）
+        schedule.every().day.at("02:00").do(lambda: (
+            print("🔄 开始定期训练深度学习模型..."),
+            train_deep_learning_model()
+        ))
+        
+        # 每天凌晨3点执行自我修正
+        schedule.every().day.at("03:00").do(lambda: (
+            print("🧠 开始算法自我修正..."),
+            self_correct_trading_algorithm()
+        ))
+        
+        # 检查是否需要训练模型（每100个新信号后）
+        def check_and_train_model():
+            if os.path.exists(SIGNAL_HISTORY_FILE):
+                with open(SIGNAL_HISTORY_FILE, 'r', encoding='utf-8') as f:
+                    history = json.load(f)
+                if len(history) % DL_TRAIN_INTERVAL == 0 and len(history) >= DL_MIN_SIGNALS_FOR_TRAIN:
+                    print(f"🔄 检测到{len(history)}个信号，开始训练深度学习模型...")
+                    train_deep_learning_model()
+        
+        print(f"\n✅ 机器人运行中...")
+        print(f"   - 每{MONITOR_INTERVAL//60}分钟检查一次ETH信号")
+        print(f"   - 每1分钟检查一次止损止盈")
+        print(f"   - 自动交易: {'已启用' if AUTO_TRADE_ENABLED else '已禁用（仅监控模式）'}")
+        if TENSORFLOW_AVAILABLE:
+            print(f"   - 🤖 深度学习: 已启用（LSTM模型）")
+            print(f"   - 🧠 自我修正: 每天03:00自动执行")
+        else:
+            print(f"   - ⚠️  深度学习: 未安装TensorFlow（pip install tensorflow）")
+        if not AUTO_TRADE_ENABLED:
+            print(f"   ⚠️  注意：当前为仅监控模式，不会执行实际交易")
+            print(f"   ⚠️  如需启用自动交易，请将 AUTO_TRADE_ENABLED 设置为 True")
+        print(f"按 Ctrl+C 停止\n")
         
         try:
             while True:
@@ -1012,3 +2083,11 @@ if __name__ == "__main__":
         except KeyboardInterrupt:
             log("🛑 机器人已停止", send_to_telegram=True)
             print("\n机器人已停止")
+            # 显示最终统计
+            stats = get_trade_statistics()
+            if stats:
+                print(f"\n📊 最终交易统计:")
+                print(f"总交易次数: {stats['total_trades']}")
+                print(f"已平仓次数: {stats['closed_trades']}")
+                print(f"胜率: {stats['win_rate']:.2f}%")
+                print(f"总盈亏: {stats['total_pnl']:+.2f} USDT")
