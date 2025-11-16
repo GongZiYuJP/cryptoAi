@@ -8,7 +8,9 @@ from sklearn.preprocessing import StandardScaler, MinMaxScaler
 import joblib
 import time
 from datetime import datetime, timedelta
-import schedule
+from apscheduler.schedulers.blocking import BlockingScheduler
+from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.triggers.cron import CronTrigger
 import sys
 import ta  # 技术指标库
 import json
@@ -55,12 +57,14 @@ COINS = ['BTC', 'ETH', 'SOL', 'XRP', 'BNB']
 # ETH专用配置（合约交易）
 ETH_SYMBOL = 'ETH/USDT:USDT'  # 永续合约格式
 TIMEFRAME = '1h'  # 主时间周期
-SMALL_TIMEFRAMES = ['5m', '15m']  # 小级别K线用于精确入场
+SMALL_TIMEFRAMES = ['15m']  # 小级别K线用于精确入场（仅使用15分钟）
 LEVERAGE = {'LONG': 3, 'SHORT': 3}  # 杠杆倍数
 RISK_PER_TRADE = 0.01  # 1%风险
 STOP_LOSS_PCT = 0.02  # 2%止损
 TAKE_PROFIT_PCT = 0.06  # 6%止盈，盈亏比3:1
 SIGNAL_THRESHOLD = 70  # 信号强度阈值（0-100）
+MIN_RISK_REWARD_RATIO = 3.0  # 最小盈亏比（至少3:1）
+MAX_RISK_PCT = 0.03  # 最大风险百分比（止损不超过3%）
 MODEL_PATH = "ai_model.pkl"
 LOG_FILE = "trading_log.txt"
 # 实时监控间隔（秒）
@@ -75,6 +79,13 @@ MAX_POSITIONS = 1  # 最多同时持有1个仓位
 TRADE_RECORD_FILE = "trade_records.json"
 # 信号历史记录文件（用于深度学习）
 SIGNAL_HISTORY_FILE = "signal_history.json"
+# 最近发送的信号记录（用于防止重复通知）
+LAST_SIGNAL_FILE = "last_signal.json"
+# 信号通知冷却时间（秒）- 相同方向的信号在冷却时间内不重复发送
+SIGNAL_COOLDOWN = 300  # 5分钟内不重复发送相同方向的信号
+# 模拟盘配置
+IS_SANDBOX = True  # 是否为模拟盘（True=模拟盘，False=实盘）
+SANDBOX_DEFAULT_BALANCE = 1000.0  # 模拟盘默认资金（USDT）
 # 深度学习模型路径
 DL_MODEL_PATH = "dl_lstm_model.h5"
 DL_SCALER_PATH = "dl_scaler.pkl"
@@ -197,10 +208,13 @@ def load_or_train_model(df_features, labels):
         model.fit(X_train, y_train)
         joblib.dump(model, MODEL_PATH)
 
-    # 持续学习：partial_fit (XGBoost支持增量)
-    if len(df_features) > 0:
-        model.partial_fit(df_features, labels)  # 假设有新数据
-        joblib.dump(model, MODEL_PATH)
+    # 注意：GradientBoostingClassifier不支持partial_fit
+    # 如果需要增量学习，需要重新训练模型或使用支持partial_fit的模型（如SGDClassifier）
+    # 当前实现：每次有新数据时重新训练（如果需要）
+    # if len(df_features) > 0:
+    #     # GradientBoostingClassifier不支持partial_fit，需要重新训练
+    #     # 这里暂时注释掉，避免运行时错误
+    #     pass
     return model
 
 # ==================== 深度学习功能 ====================
@@ -242,10 +256,8 @@ def record_signal_history(signal):
             'macd': float(current.get('macd', 0)),
             'macd_signal': float(current.get('macd_signal', 0)),
             'macd_hist': float(current.get('macd_hist', 0)),
-            'ema7': float(current.get('ema7', 0)),
-            'ema14': float(current.get('ema14', 0)),
-            'ema21': float(current.get('ema21', 0)),
-            'ema50': float(current.get('ema50', 0)),
+            'ema20': float(current.get('ema20', 0)),
+            'ema60': float(current.get('ema60', 0)),
             'vol_ratio': float(current.get('vol_ratio', 0)),
             'atr_pct': float(current.get('atr_pct', 0)),
             # 后续价格走势（待填充）
@@ -453,10 +465,8 @@ def prepare_training_data():
                         float(row.get('rsi', 0)),
                         float(row.get('macd', 0)),
                         float(row.get('macd_hist', 0)),
-                        float(row.get('ema7', 0)),
-                        float(row.get('ema14', 0)),
-                        float(row.get('ema21', 0)),
-                        float(row.get('ema50', 0)),
+                        float(row.get('ema20', 0)),
+                        float(row.get('ema60', 0)),
                         float(row.get('vol_ratio', 0)),
                         float(row.get('atr_pct', 0)),
                     ]
@@ -693,21 +703,13 @@ def get_historical_data(symbol, timeframe=None, limit=500):
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         
-        # MA (移动平均线) - 多个周期
-        df['ma7'] = df['close'].rolling(7).mean()
-        df['ma14'] = df['close'].rolling(14).mean()
-        df['ma21'] = df['close'].rolling(21).mean()
-        df['ma50'] = df['close'].rolling(50).mean()
-        df['ma100'] = df['close'].rolling(100).mean()
-        df['ma200'] = df['close'].rolling(200).mean()
+        # MA (移动平均线) - 20和60周期
+        df['ma20'] = df['close'].rolling(20).mean()
+        df['ma60'] = df['close'].rolling(60).mean()
         
-        # EMA (指数移动平均线) - 多个周期
-        df['ema7'] = df['close'].ewm(span=7, adjust=False).mean()
-        df['ema14'] = df['close'].ewm(span=14, adjust=False).mean()
-        df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
-        df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
-        df['ema100'] = df['close'].ewm(span=100, adjust=False).mean()
-        df['ema200'] = df['close'].ewm(span=200, adjust=False).mean()
+        # EMA (指数移动平均线) - 20和60周期
+        df['ema20'] = df['close'].ewm(span=20, adjust=False).mean()
+        df['ema60'] = df['close'].ewm(span=60, adjust=False).mean()
         
         # RSI (相对强弱指标)
         rsi_indicator = ta.momentum.RSIIndicator(df['close'], window=14)
@@ -904,65 +906,63 @@ def analyze_ma_strategy(df):
     使用均线法判断做多/做空
     返回: {direction: 'LONG'/'SHORT'/'NEUTRAL', score: float, details: str}
     """
-    if len(df) < 200:
-        return {'direction': 'NEUTRAL', 'score': 0, 'details': '数据不足'}
+    if len(df) < 60:
+        return {'direction': 'NEUTRAL', 'score': 0, 'details': '数据不足（需要至少60根K线）'}
     
     current = df.iloc[-1]
     price = current['close']
     
-    # 均线排列
-    ema7 = current['ema7']
-    ema14 = current['ema14']
-    ema21 = current['ema21']
-    ema50 = current['ema50']
-    ema100 = current['ema100']
-    ema200 = current['ema200']
+    # 均线排列 - 使用EMA20和EMA60
+    ema20 = current['ema20']
+    ema60 = current['ema60']
+    ma20 = current['ma20']
+    ma60 = current['ma60']
     
     long_score = 0
     short_score = 0
     details = []
     
     # 1. 均线多头排列（短期>长期）
-    if ema7 > ema14 > ema21 > ema50:
+    if ema20 > ema60 and ma20 > ma60:
         long_score += 30
-        details.append("✅ 均线多头排列")
-    elif ema7 < ema14 < ema21 < ema50:
+        details.append("✅ 均线多头排列（EMA20>EMA60, MA20>MA60）")
+    elif ema20 < ema60 and ma20 < ma60:
         short_score += 30
-        details.append("❌ 均线空头排列")
+        details.append("❌ 均线空头排列（EMA20<EMA60, MA20<MA60）")
     
     # 2. 价格与均线关系
-    if price > ema7 > ema14 > ema21:
+    if price > ema20 > ema60:
         long_score += 20
-        details.append("✅ 价格在均线上方")
-    elif price < ema7 < ema14 < ema21:
+        details.append("✅ 价格在均线上方（价格>EMA20>EMA60）")
+    elif price < ema20 < ema60:
         short_score += 20
-        details.append("❌ 价格在均线下方")
+        details.append("❌ 价格在均线下方（价格<EMA20<EMA60）")
     
-    # 3. EMA50作为关键支撑/阻力
-    if price > ema50 and ema7 > ema50:
+    # 3. EMA60作为关键支撑/阻力
+    if price > ema60 and ema20 > ema60:
         long_score += 15
-        details.append("✅ 价格在EMA50上方")
-    elif price < ema50 and ema7 < ema50:
+        details.append("✅ 价格在EMA60上方")
+    elif price < ema60 and ema20 < ema60:
         short_score += 15
-        details.append("❌ 价格在EMA50下方")
+        details.append("❌ 价格在EMA60下方")
     
-    # 4. EMA200长期趋势
-    if price > ema200:
+    # 4. MA60长期趋势
+    if price > ma60:
         long_score += 10
-        details.append("✅ 价格在EMA200上方（长期看涨）")
+        details.append("✅ 价格在MA60上方（长期看涨）")
     else:
         short_score += 10
-        details.append("❌ 价格在EMA200下方（长期看跌）")
+        details.append("❌ 价格在MA60下方（长期看跌）")
     
     # 5. 均线斜率（趋势强度）
     if len(df) >= 5:
-        ema7_slope = (ema7 - df.iloc[-5]['ema7']) / df.iloc[-5]['ema7']
-        if ema7_slope > 0.001:  # 上升趋势
+        ema20_slope = (ema20 - df.iloc[-5]['ema20']) / df.iloc[-5]['ema20']
+        if ema20_slope > 0.001:  # 上升趋势
             long_score += 10
-            details.append(f"✅ EMA7上升趋势 ({ema7_slope*100:.2f}%)")
-        elif ema7_slope < -0.001:  # 下降趋势
+            details.append(f"✅ EMA20上升趋势 ({ema20_slope*100:.2f}%)")
+        elif ema20_slope < -0.001:  # 下降趋势
             short_score += 10
-            details.append(f"❌ EMA7下降趋势 ({ema7_slope*100:.2f}%)")
+            details.append(f"❌ EMA20下降趋势 ({ema20_slope*100:.2f}%)")
     
     total_score = long_score - short_score
     
@@ -985,27 +985,42 @@ def analyze_ma_strategy(df):
 def analyze_eth_advanced():
     """
     综合分析ETH走势：
-    1. 使用均线法判断大方向（做多/做空）
-    2. 识别K线形态（赛福形态等）
-    3. 使用小级别K线（5m, 15m）和FVG找最佳入场点
+    1. 使用均线法判断大方向（做多/做空）- 1小时线级别
+    2. 确保1小时和15分钟K线的多空方向一致
+    3. 从15分钟K线找买入点
     返回: 完整的交易信号
     """
     try:
         # 1. 主时间周期分析（1h）- 判断大方向
         df_1h = get_historical_data(ETH_SYMBOL, timeframe='1h', limit=300)
-        if df_1h.empty or len(df_1h) < 200:
+        if df_1h.empty or len(df_1h) < 60:
             return None
         
         current_price = df_1h.iloc[-1]['close']
         
-        # 均线策略判断
-        ma_analysis = analyze_ma_strategy(df_1h)
-        main_direction = ma_analysis['direction']
+        # 均线策略判断（1小时级别）
+        ma_analysis_1h = analyze_ma_strategy(df_1h)
+        main_direction_1h = ma_analysis_1h['direction']
         
-        if main_direction == 'NEUTRAL':
+        if main_direction_1h == 'NEUTRAL':
             return None  # 方向不明确，不交易
         
-        # K线形态识别
+        # 2. 15分钟K线分析 - 确保方向一致
+        df_15m = get_historical_data(ETH_SYMBOL, timeframe='15m', limit=200)
+        if df_15m.empty or len(df_15m) < 60:
+            return None
+        
+        # 15分钟级别的均线策略判断
+        ma_analysis_15m = analyze_ma_strategy(df_15m)
+        main_direction_15m = ma_analysis_15m['direction']
+        
+        # 确保1小时和15分钟的多空方向一致
+        if main_direction_1h != main_direction_15m:
+            return None  # 方向不一致，不交易
+        
+        main_direction = main_direction_1h  # 使用一致的方向
+        
+        # K线形态识别（1小时级别）
         patterns = detect_candlestick_patterns(df_1h)
         
         # 形态评分
@@ -1034,66 +1049,64 @@ def analyze_eth_advanced():
                 if patterns.get('three_black_crows'):
                     pattern_signals.append("⚫ 三只乌鸦（强烈看跌）")
         
-        # 2. 小级别K线分析 - 找精确入场点
+        # 3. 从15分钟K线找精确入场点
         best_entry_points = []
         
-        for small_tf in SMALL_TIMEFRAMES:
-            try:
-                df_small = get_historical_data(ETH_SYMBOL, timeframe=small_tf, limit=200)
-                if df_small.empty or len(df_small) < 50:
-                    continue
+        # 只使用15分钟K线
+        small_tf = '15m'
+        try:
+            df_small = df_15m  # 使用已经获取的15分钟数据
+            
+            # 检测FVG
+            fvgs = detect_fvg(df_small, min_size_pct=FVG_MIN_SIZE)
+            
+            # 筛选有效的FVG（与主方向一致）
+            valid_fvgs = []
+            for fvg in fvgs:
+                # 只保留最近20根K线内的FVG
+                if len(df_small) - fvg['index'] <= 20:
+                    if (main_direction == 'LONG' and fvg['type'] == 'bullish') or \
+                       (main_direction == 'SHORT' and fvg['type'] == 'bearish'):
+                        valid_fvgs.append(fvg)
+            
+            # 找到最佳入场点
+            for fvg in valid_fvgs:
+                # 检查价格是否接近FVG
+                fvg_mid = fvg['mid']
+                price_distance = abs(current_price - fvg_mid) / current_price
                 
-                # 检测FVG
-                fvgs = detect_fvg(df_small, min_size_pct=FVG_MIN_SIZE)
-                
-                # 筛选有效的FVG（与主方向一致）
-                valid_fvgs = []
-                for fvg in fvgs:
-                    # 只保留最近20根K线内的FVG
-                    if len(df_small) - fvg['index'] <= 20:
-                        if (main_direction == 'LONG' and fvg['type'] == 'bullish') or \
-                           (main_direction == 'SHORT' and fvg['type'] == 'bearish'):
-                            valid_fvgs.append(fvg)
-                
-                # 找到最佳入场点
-                for fvg in valid_fvgs:
-                    # 检查价格是否接近FVG
-                    fvg_mid = fvg['mid']
-                    price_distance = abs(current_price - fvg_mid) / current_price
+                # 如果价格在FVG附近（1%以内），这是一个好的入场点
+                if price_distance < 0.01:
+                    entry_price = fvg_mid
                     
-                    # 如果价格在FVG附近（1%以内），这是一个好的入场点
-                    if price_distance < 0.01:
-                        entry_price = fvg_mid
-                        
-                        # 计算止损止盈
-                        if main_direction == 'LONG':
-                            # 做多：止损在FVG底部下方，止盈在FVG顶部上方
-                            stop_loss = fvg['bottom'] * 0.998  # FVG底部下方0.2%
-                            take_profit = fvg['top'] * 1.002 + (fvg['top'] - fvg['bottom']) * 2  # FVG顶部上方+2倍FVG高度
-                        else:
-                            # 做空：止损在FVG顶部上方，止盈在FVG底部下方
-                            stop_loss = fvg['top'] * 1.002  # FVG顶部上方0.2%
-                            take_profit = fvg['bottom'] * 0.998 - (fvg['top'] - fvg['bottom']) * 2  # FVG底部下方-2倍FVG高度
-                        
-                        # 计算盈亏比
-                        risk = abs(entry_price - stop_loss)
-                        reward = abs(take_profit - entry_price)
-                        risk_reward = reward / risk if risk > 0 else 0
-                        
-                        if risk_reward >= 2.0:  # 盈亏比至少2:1
-                            best_entry_points.append({
-                                'timeframe': small_tf,
-                                'entry_price': entry_price,
-                                'stop_loss': stop_loss,
-                                'take_profit': take_profit,
-                                'risk_reward': risk_reward,
-                                'fvg': fvg,
-                                'price_distance_pct': price_distance * 100
-                            })
-                
-            except Exception as e:
-                print(f"分析{small_tf}时间周期错误: {e}")
-                continue
+                    # 计算止损止盈
+                    if main_direction == 'LONG':
+                        # 做多：止损在FVG底部下方，止盈在FVG顶部上方
+                        stop_loss = fvg['bottom'] * 0.998  # FVG底部下方0.2%
+                        take_profit = fvg['top'] * 1.002 + (fvg['top'] - fvg['bottom']) * 2  # FVG顶部上方+2倍FVG高度
+                    else:
+                        # 做空：止损在FVG顶部上方，止盈在FVG底部下方
+                        stop_loss = fvg['top'] * 1.002  # FVG顶部上方0.2%
+                        take_profit = fvg['bottom'] * 0.998 - (fvg['top'] - fvg['bottom']) * 2  # FVG底部下方-2倍FVG高度
+                    
+                    # 计算盈亏比
+                    risk = abs(entry_price - stop_loss)
+                    reward = abs(take_profit - entry_price)
+                    risk_reward = reward / risk if risk > 0 else 0
+                    
+                    if risk_reward >= MIN_RISK_REWARD_RATIO:  # 盈亏比至少3:1
+                        best_entry_points.append({
+                            'timeframe': small_tf,
+                            'entry_price': entry_price,
+                            'stop_loss': stop_loss,
+                            'take_profit': take_profit,
+                            'risk_reward': risk_reward,
+                            'fvg': fvg,
+                            'price_distance_pct': price_distance * 100
+                        })
+            
+        except Exception as e:
+            print(f"分析{small_tf}时间周期错误: {e}")
         
         # 如果没有找到FVG入场点，使用ATR计算止损止盈
         if not best_entry_points:
@@ -1125,7 +1138,11 @@ def analyze_eth_advanced():
         best_entry = max(best_entry_points, key=lambda x: x['risk_reward']) if best_entry_points else None
         
         if not best_entry:
-            return None
+            return None  # 没有找到合适的入场点，观望
+        
+        # 确保best_entry包含必要的字段
+        if 'risk_reward' not in best_entry or 'entry_price' not in best_entry or 'stop_loss' not in best_entry:
+            return None  # 入场点数据不完整，观望
         
         # 3. 深度学习模型预测（如果可用）
         dl_prediction = None
@@ -1145,12 +1162,58 @@ def analyze_eth_advanced():
                     dl_adjustment = -30
                     pattern_signals.append(f"⚠️ 深度学习警告: 预测方向相反 ({dl_prediction['predicted_direction']})")
         
-        # 计算综合信号强度（结合深度学习）
-        signal_strength = ma_analysis['score'] + pattern_score + dl_adjustment
+        # 计算综合信号强度（结合1小时和15分钟的分析）
+        signal_strength = (ma_analysis_1h['score'] + ma_analysis_15m['score']) / 2 + pattern_score + dl_adjustment
         signal_strength = max(0, min(signal_strength, 100))  # 限制在0-100之间
         
+        # ========== 严格过滤条件：只有满足所有条件才生成信号 ==========
+        
+        # 1. 检查信号强度阈值
         if signal_strength < SIGNAL_THRESHOLD:
-            return None
+            return None  # 信号强度不足，观望
+        
+        # 2. 检查盈亏比（必须至少达到最小盈亏比）
+        if best_entry['risk_reward'] < MIN_RISK_REWARD_RATIO:
+            return None  # 盈亏比不足，风险高，观望
+        
+        # 3. 检查风险百分比（止损不能太大）
+        entry_price = best_entry['entry_price']
+        stop_loss = best_entry['stop_loss']
+        risk_pct = abs(entry_price - stop_loss) / entry_price
+        if risk_pct > MAX_RISK_PCT:
+            return None  # 风险过高，观望
+        
+        # 4. 检查均线形态是否适合做合约
+        # 要求：均线排列清晰，方向明确
+        ma_score_1h = ma_analysis_1h.get('score', 0)
+        ma_score_15m = ma_analysis_15m.get('score', 0)
+        avg_ma_score = (ma_score_1h + ma_score_15m) / 2
+        
+        # 均线得分低于30分，说明均线形态不清晰，不适合做合约
+        if avg_ma_score < 30:
+            return None  # 均线形态不清晰，观望
+        
+        # 5. 检查K线形态是否适合做合约
+        # 如果有不利形态，不交易
+        unfavorable_patterns = []
+        if main_direction == 'LONG':
+            # 做多时，如果有看跌形态，不适合
+            if patterns.get('hanging_man') or patterns.get('bearish_engulfing') or patterns.get('three_black_crows'):
+                unfavorable_patterns.append("存在看跌形态")
+        else:  # SHORT
+            # 做空时，如果有看涨形态，不适合
+            if patterns.get('hammer') or patterns.get('bullish_engulfing') or patterns.get('three_white_soldiers'):
+                unfavorable_patterns.append("存在看涨形态")
+        
+        # 如果有不利形态且没有有利形态，不交易
+        if unfavorable_patterns and pattern_score == 0:
+            return None  # K线形态不适合，观望
+        
+        # 6. 检查是否有明确的K线形态支持（加分项，但不是必须）
+        # 如果没有明确的形态支持，但其他条件都满足，仍然可以交易
+        # 这里只做记录，不强制要求
+        
+        # ========== 所有条件都满足，生成信号 ==========
         
         # 构建完整信号
         signal = {
@@ -1161,7 +1224,8 @@ def analyze_eth_advanced():
             'stop_loss': best_entry['stop_loss'],
             'take_profit': best_entry['take_profit'],
             'risk_reward_ratio': best_entry['risk_reward'],
-            'ma_analysis': ma_analysis,
+            'ma_analysis_1h': ma_analysis_1h,
+            'ma_analysis_15m': ma_analysis_15m,
             'patterns': pattern_signals,
             'best_entry': best_entry,
             'all_fvg_entries': best_entry_points,
@@ -1221,22 +1285,22 @@ def analyze_eth_signal():
         
         # 2. MA/EMA 均线分析 (权重: 25分)
         # 多头排列：短期均线在长期均线之上
-        ma_bullish = (current['ema7'] > current['ema14'] > current['ema21'] > current['ema50'])
-        ma_bearish = (current['ema7'] < current['ema14'] < current['ema21'] < current['ema50'])
+        ma_bullish = (current['ema20'] > current['ema60'] and current['ma20'] > current['ma60'])
+        ma_bearish = (current['ema20'] < current['ema60'] and current['ma20'] < current['ma60'])
         
-        if ma_bullish and current['close'] > current['ema7']:
+        if ma_bullish and current['close'] > current['ema20']:
             long_score += 25
-            signal_details['ma_signal'] = '多头排列，价格在均线上方'
-        elif ma_bearish and current['close'] < current['ema7']:
+            signal_details['ma_signal'] = '多头排列，价格在均线上方（EMA20>EMA60）'
+        elif ma_bearish and current['close'] < current['ema20']:
             short_score += 25
-            signal_details['ma_signal'] = '空头排列，价格在均线下方'
+            signal_details['ma_signal'] = '空头排列，价格在均线下方（EMA20<EMA60）'
         else:
-            if current['close'] > current['ema50']:
+            if current['close'] > current['ema60']:
                 long_score += 10
-                signal_details['ma_signal'] = '价格在EMA50上方'
+                signal_details['ma_signal'] = '价格在EMA60上方'
             else:
                 short_score += 10
-                signal_details['ma_signal'] = '价格在EMA50下方'
+                signal_details['ma_signal'] = '价格在EMA60下方'
         
         # 3. MACD 分析 (权重: 25分)
         macd_hist = current['macd_hist']
@@ -1304,10 +1368,54 @@ def analyze_eth_signal():
         print(f"分析ETH信号错误: {e}")
         return None
 
+# 检查是否应该发送信号通知（防止重复发送）
+def should_send_signal(signal_details):
+    """检查是否应该发送信号通知，避免重复发送"""
+    try:
+        direction = signal_details.get('direction')
+        entry_price = signal_details.get('entry_price', 0)
+        current_time = datetime.now()
+        
+        # 读取上次发送的信号记录
+        if os.path.exists(LAST_SIGNAL_FILE):
+            with open(LAST_SIGNAL_FILE, 'r', encoding='utf-8') as f:
+                last_signal = json.load(f)
+            
+            last_direction = last_signal.get('direction')
+            last_time_str = last_signal.get('timestamp')
+            
+            if last_direction == direction and last_time_str:
+                last_time = datetime.fromisoformat(last_time_str)
+                time_diff = (current_time - last_time).total_seconds()
+                
+                # 如果相同方向且在冷却时间内，不发送
+                if time_diff < SIGNAL_COOLDOWN:
+                    print(f"⏸️ 信号通知冷却中（{int(SIGNAL_COOLDOWN - time_diff)}秒后可发送）")
+                    return False
+        
+        # 保存当前信号记录
+        signal_record = {
+            'direction': direction,
+            'entry_price': entry_price,
+            'timestamp': current_time.isoformat(),
+            'signal_strength': signal_details.get('signal_strength', 0)
+        }
+        with open(LAST_SIGNAL_FILE, 'w', encoding='utf-8') as f:
+            json.dump(signal_record, f, indent=2, ensure_ascii=False)
+        
+        return True
+    except Exception as e:
+        print(f"检查信号发送条件错误: {e}")
+        return True  # 出错时允许发送，避免错过信号
+
 # 生成交易信号通知（支持高级分析）
 def send_trading_signal(signal_details):
-    """发送详细的交易信号到Telegram（支持FVG和形态分析）"""
+    """发送详细的交易信号到Telegram（支持FVG和形态分析）- 立即发送"""
     try:
+        # 检查是否应该发送（防止重复）
+        if not should_send_signal(signal_details):
+            return False
+        
         # 检查是否是高级分析信号
         is_advanced = 'best_entry' in signal_details
         
@@ -1321,7 +1429,8 @@ def send_trading_signal(signal_details):
             risk_reward_ratio = signal_details['risk_reward_ratio']
             current_price = signal_details['current_price']
             best_entry = signal_details['best_entry']
-            ma_analysis = signal_details['ma_analysis']
+            ma_analysis_1h = signal_details.get('ma_analysis_1h', {})
+            ma_analysis_15m = signal_details.get('ma_analysis_15m', {})
             patterns = signal_details.get('patterns', [])
             
             direction_emoji = "📈" if direction == 'LONG' else "📉"
@@ -1354,10 +1463,15 @@ def send_trading_signal(signal_details):
                 message += f"时间周期: {best_entry['timeframe']}\n"
                 message += f"使用ATR计算止损止盈\n\n"
             
-            # 均线分析
+            # 均线分析（1小时和15分钟）
             message += f"<b>📊 均线策略分析</b>\n"
-            message += f"{ma_analysis['details']}\n"
-            message += f"均线得分: {ma_analysis['score']}/100\n\n"
+            if ma_analysis_1h:
+                message += f"<b>1小时级别:</b> {ma_analysis_1h.get('details', '')}\n"
+                message += f"得分: {ma_analysis_1h.get('score', 0)}/100\n"
+            if ma_analysis_15m:
+                message += f"<b>15分钟级别:</b> {ma_analysis_15m.get('details', '')}\n"
+                message += f"得分: {ma_analysis_15m.get('score', 0)}/100\n"
+            message += "\n"
             
             # K线形态
             if patterns:
@@ -1383,7 +1497,8 @@ def send_trading_signal(signal_details):
             
             message += f"<b>⏰ 时间:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
             message += f"━━━━━━━━━━━━━━━━━━━━\n"
-            message += f"⚠️ <i>此为分析信号，请结合市场情况谨慎操作</i>"
+            message += f"⚠️ <i>此为分析信号，请结合市场情况谨慎操作</i>\n"
+            message += f"🚀 <b>立即关注！适合交易的时机</b>"
             
         else:
             # 旧版信号格式（兼容）
@@ -1419,8 +1534,14 @@ def send_trading_signal(signal_details):
             message += f"盈亏比: <b>{risk_reward_ratio:.2f}:1</b>\n\n"
             message += f"<b>⏰ 时间:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
             message += f"━━━━━━━━━━━━━━━━━━━━\n"
+            message += f"🚀 <b>立即关注！适合交易的时机</b>"
         
-        log(message)
+        # 立即发送到Telegram（不等待日志写入）
+        send_telegram(message)
+        
+        # 然后记录日志
+        log(message, send_to_telegram=False)  # 避免重复发送
+        
         return True
         
     except Exception as e:
@@ -1481,35 +1602,146 @@ def check_status():
     try:
         # 合约账户余额
         balance = exchange.fetch_balance({'type': 'future'})
-        usdt_balance = balance.get('USDT', {}).get('total', 0)
-        usdt_free = balance.get('USDT', {}).get('free', 0)
         
-        status_message = f"📈 <b>合约账户状态</b>\n\n" \
-                        f"USDT总余额: {usdt_balance:.2f} USDT\n" \
-                        f"USDT可用余额: {usdt_free:.2f} USDT\n"
+        # 安全地获取USDT余额（处理None和字符串格式）
+        # 币安API可能返回不同的结构，尝试多种方式获取
+        usdt_balance = 0.0
+        usdt_free = 0.0
+        
+        # 方式1: 直接从USDT键获取
+        usdt_info = balance.get('USDT')
+        if usdt_info:
+            if isinstance(usdt_info, dict):
+                usdt_balance = usdt_info.get('total', 0) or 0
+                usdt_free = usdt_info.get('free', 0) or 0
+            else:
+                # 如果直接是数值
+                try:
+                    usdt_balance = float(usdt_info)
+                    usdt_free = float(usdt_info)
+                except (ValueError, TypeError):
+                    pass
+        
+        # 方式2: 尝试从info中获取（币安原始数据）
+        if usdt_balance == 0.0 and 'info' in balance:
+            try:
+                info = balance['info']
+                if isinstance(info, list) and len(info) > 0:
+                    for asset in info:
+                        if asset.get('asset') == 'USDT':
+                            usdt_balance = float(asset.get('balance', 0) or 0)
+                            usdt_free = float(asset.get('availableBalance', asset.get('balance', 0)) or 0)
+                            break
+            except Exception as e:
+                print(f"从info获取余额失败: {e}")
+        
+        # 转换为float（处理字符串格式）
+        try:
+            usdt_balance = float(usdt_balance) if usdt_balance else 0.0
+            usdt_free = float(usdt_free) if usdt_free else 0.0
+        except (ValueError, TypeError):
+            usdt_balance = 0.0
+            usdt_free = 0.0
+        
+        # 模拟盘默认资金：如果余额为0且是模拟盘，使用默认资金
+        is_sandbox_mode = IS_SANDBOX or exchange.sandbox if hasattr(exchange, 'sandbox') else IS_SANDBOX
+        if is_sandbox_mode and usdt_balance == 0.0:
+            usdt_balance = SANDBOX_DEFAULT_BALANCE
+            usdt_free = SANDBOX_DEFAULT_BALANCE
+            balance_note = f" (模拟盘默认资金)"
+        else:
+            balance_note = ""
+        
+        # 获取默认杠杆（从配置中）
+        default_leverage = LEVERAGE.get('LONG', 3)
         
         # 获取当前持仓（合约）
         positions = exchange.fetch_positions([ETH_SYMBOL])
-        active_positions = [pos for pos in positions if float(pos.get('contracts', 0)) != 0]
+        active_positions = [pos for pos in positions if float(pos.get('contracts', 0) or 0) != 0]
+        
+        # 确定持仓方向（用于标题显示）
+        position_direction = None
+        position_emoji = ""
+        position_text = ""
         
         if active_positions:
-            status_message += f"\n<b>当前持仓:</b>\n"
+            pos = active_positions[0]  # 取第一个持仓
+            side = pos.get('side', 'unknown').upper()
+            
+            if side == 'LONG':
+                position_direction = 'LONG'
+                position_emoji = "📈"
+                position_text = "做多 (LONG)"
+            elif side == 'SHORT':
+                position_direction = 'SHORT'
+                position_emoji = "📉"
+                position_text = "做空 (SHORT)"
+            else:
+                position_text = f"持仓 ({side})"
+        else:
+            position_emoji = "⚪"
+            position_text = "无持仓"
+        
+        # 构建状态消息（在标题中显示持仓方向）
+        mode_text = "🧪 模拟盘" if is_sandbox_mode else "💰 实盘"
+        status_message = f"📈 <b>合约账户状态</b> {mode_text} | {position_emoji} <b>{position_text}</b>\n\n" \
+                        f"USDT总余额: {usdt_balance:.2f} USDT{balance_note}\n" \
+                        f"USDT可用余额: {usdt_free:.2f} USDT{balance_note}\n"
+        
+        if active_positions:
+            status_message += f"\n<b>当前持仓详情:</b>\n"
             for pos in active_positions:
                 side = pos.get('side', 'unknown')
-                contracts = float(pos.get('contracts', 0))
-                entry_price = float(pos.get('entryPrice', 0))
-                mark_price = float(pos.get('markPrice', 0))
-                unrealized_pnl = float(pos.get('unrealizedPnl', 0))
-                percentage = float(pos.get('percentage', 0))
-                leverage = pos.get('leverage', 1)
+                contracts = float(pos.get('contracts', 0) or 0)
+                entry_price = float(pos.get('entryPrice', 0) or 0)
+                mark_price = float(pos.get('markPrice', 0) or 0)
+                unrealized_pnl = float(pos.get('unrealizedPnl', 0) or 0)
+                percentage = float(pos.get('percentage', 0) or 0)
                 
-                status_message += f"  {side.upper()}: {abs(contracts)} 张\n"
+                # 安全地获取杠杆
+                leverage = pos.get('leverage')
+                if leverage is None:
+                    leverage = default_leverage
+                else:
+                    try:
+                        leverage = int(leverage) if leverage else default_leverage
+                    except (ValueError, TypeError):
+                        leverage = default_leverage
+                
+                # 获取合约面值（用于计算持仓价值）
+                try:
+                    market = exchange.market(ETH_SYMBOL)
+                    contract_size = float(market.get('contractSize', 1))
+                except:
+                    contract_size = 1.0
+                
+                # 计算持仓价值（USDT）
+                # 持仓价值 = 合约数量 * 标记价格 * 合约面值
+                position_value_usdt = abs(contracts) * mark_price * contract_size
+                
+                # 计算开仓保证金（USDT）
+                # 开仓保证金 = 持仓价值 / 杠杆
+                margin_usdt = position_value_usdt / leverage if leverage > 0 else 0
+                
+                # 计算开仓价值（USDT）
+                entry_value_usdt = abs(contracts) * entry_price * contract_size
+                
+                # 明确显示做多或做空
+                side_emoji = "📈" if side.upper() == 'LONG' else "📉"
+                side_text = "做多 (LONG)" if side.upper() == 'LONG' else "做空 (SHORT)" if side.upper() == 'SHORT' else side.upper()
+                
+                status_message += f"  {side_emoji} <b>方向: {side_text}</b>\n"
+                status_message += f"  合约数量: {abs(contracts)} 张\n"
                 status_message += f"  开仓价: {entry_price:.2f} USDT\n"
                 status_message += f"  标记价: {mark_price:.2f} USDT\n"
                 status_message += f"  杠杆: {leverage}x\n"
+                status_message += f"  <b>持仓价值: {position_value_usdt:.2f} USDT</b>\n"
+                status_message += f"  开仓价值: {entry_value_usdt:.2f} USDT\n"
+                status_message += f"  开仓保证金: {margin_usdt:.2f} USDT\n"
                 status_message += f"  未实现盈亏: {unrealized_pnl:+.2f} USDT ({percentage:+.2f}%)\n"
         else:
-            status_message += "\n无持仓\n"
+            status_message += f"\n<b>持仓状态:</b> 无持仓\n"
+            status_message += f"默认杠杆: {default_leverage}x\n"
             
         log(status_message)
         # 读取最后10行日志
@@ -1631,7 +1863,25 @@ def execute_trade(signal):
         
         # 获取合约账户余额
         balance = exchange.fetch_balance({'type': 'future'})
-        usdt_balance = balance.get('USDT', {}).get('free', 0)
+        
+        # 安全地获取USDT余额
+        usdt_info = balance.get('USDT', {})
+        if isinstance(usdt_info, dict):
+            usdt_balance = usdt_info.get('free', 0) or 0
+        else:
+            usdt_balance = 0
+        
+        # 转换为float
+        try:
+            usdt_balance = float(usdt_balance) if usdt_balance else 0.0
+        except (ValueError, TypeError):
+            usdt_balance = 0.0
+        
+        # 模拟盘默认资金：如果余额为0且是模拟盘，使用默认资金
+        is_sandbox_mode = IS_SANDBOX or (exchange.sandbox if hasattr(exchange, 'sandbox') else False)
+        if is_sandbox_mode and usdt_balance == 0.0:
+            usdt_balance = SANDBOX_DEFAULT_BALANCE
+            print(f"🧪 模拟盘模式：使用默认资金 {SANDBOX_DEFAULT_BALANCE} USDT")
         
         if usdt_balance < 10:  # 最少需要10 USDT
             print(f"❌ USDT余额不足: {usdt_balance:.2f} USDT")
@@ -1913,6 +2163,9 @@ def monitor_eth():
             print(f"✅ 发现ETH交易信号: {signal['direction']}, 强度: {signal['signal_strength']:.1f}, "
                   f"入场: {signal['entry_price']:.2f}, 盈亏比: {signal['risk_reward_ratio']:.2f}:1")
             
+            # 🚀 立即发送通知到Telegram（优先处理）
+            send_trading_signal(signal)
+            
             # 记录信号历史（用于深度学习）
             record_signal_history(signal)
             
@@ -1924,9 +2177,6 @@ def monitor_eth():
                     print(f"🔄 检测到{len(history)}个信号，开始训练深度学习模型...")
                     train_deep_learning_model()
             
-            # 发送详细通知
-            send_trading_signal(signal)
-            
             # 如果启用自动交易，执行交易
             if AUTO_TRADE_ENABLED:
                 print("🤖 自动交易已启用，准备执行交易...")
@@ -1934,7 +2184,7 @@ def monitor_eth():
             else:
                 print("⚠️ 自动交易已禁用，仅发送信号通知")
         else:
-            # 无强信号，仅记录日志（不发送Telegram）
+            # 无强信号，仅记录日志（不发送Telegram，保持观望）
             try:
                 current_price = exchange.fetch_ticker(ETH_SYMBOL)['last']
                 position = get_current_position()
@@ -1946,8 +2196,9 @@ def monitor_eth():
                     position_info = f" | 持仓: {position['side']} {contracts}张 | 盈亏: {unrealized_pnl:+.2f} USDT ({pnl_pct:+.2f}%)"
                 
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                log_message = f"[{timestamp}] ETH监控中... 当前价格: {current_price:.2f} USDT (无强信号){position_info}"
+                log_message = f"[{timestamp}] ETH监控中... 当前价格: {current_price:.2f} USDT (观望中，等待合适信号){position_info}"
                 print(log_message)
+                # 只写入日志文件，不发送Telegram通知
                 with open(LOG_FILE, 'a', encoding='utf-8') as f:
                     f.write(log_message + "\n")
             except:
@@ -1977,7 +2228,7 @@ def analyze_all_coins():
                 current = df.iloc[-1]
                 price = current['close']
                 rsi = current['rsi']
-                ma_trend = "📈" if current['close'] > current['ema50'] else "📉"
+                ma_trend = "📈" if current['close'] > current['ema60'] else "📉"
                 macd_trend = "📈" if current['macd_hist'] > 0 else "📉"
                 
                 summary += f"<b>{coin}</b> {ma_trend}\n"
@@ -2081,46 +2332,86 @@ if __name__ == "__main__":
         # 立即执行一次分析
         monitor_eth()
         
-        # 定时任务：每5分钟监控一次ETH
-        schedule.every(MONITOR_INTERVAL // 60).minutes.do(monitor_eth)
+        # 创建BlockingScheduler调度器
+        scheduler = BlockingScheduler()
+        
+        # 定时任务：每N分钟监控一次ETH
+        scheduler.add_job(
+            monitor_eth,
+            trigger=IntervalTrigger(minutes=MONITOR_INTERVAL // 60),
+            id='monitor_eth',
+            name='监控ETH走势',
+            replace_existing=True
+        )
         
         # 每1分钟检查一次止损止盈（更频繁检查）
-        schedule.every(1).minutes.do(check_stop_loss_take_profit)
+        scheduler.add_job(
+            check_stop_loss_take_profit,
+            trigger=IntervalTrigger(minutes=1),
+            id='check_stop_loss',
+            name='检查止损止盈',
+            replace_existing=True
+        )
         
         # 每小时显示一次账户状态
-        schedule.every().hour.do(check_status)
+        scheduler.add_job(
+            check_status,
+            trigger=IntervalTrigger(hours=1),
+            id='check_status',
+            name='检查账户状态',
+            replace_existing=True
+        )
         
-        # 每天分析一次所有币种（可选）
-        schedule.every().day.at("09:00").do(analyze_all_coins)
+        # 每天分析一次所有币种（可选）- 每天09:00
+        scheduler.add_job(
+            analyze_all_coins,
+            trigger=CronTrigger(hour=9, minute=0),
+            id='analyze_all_coins',
+            name='分析所有币种',
+            replace_existing=True
+        )
         
-        # 每天显示交易统计
-        schedule.every().day.at("20:00").do(lambda: (
-            stats := get_trade_statistics(),
-            stats and log(f"📊 <b>每日交易统计</b>\n\n"
-                         f"总交易: {stats['total_trades']} | 已平仓: {stats['closed_trades']}\n"
-                         f"胜率: {stats['win_rate']:.2f}% | 总盈亏: {stats['total_pnl']:+.2f} USDT")
-        ))
+        # 每天显示交易统计 - 每天20:00
+        def daily_stats():
+            stats = get_trade_statistics()
+            if stats:
+                log(f"📊 <b>每日交易统计</b>\n\n"
+                    f"总交易: {stats['total_trades']} | 已平仓: {stats['closed_trades']}\n"
+                    f"胜率: {stats['win_rate']:.2f}% | 总盈亏: {stats['total_pnl']:+.2f} USDT")
+        
+        scheduler.add_job(
+            daily_stats,
+            trigger=CronTrigger(hour=20, minute=0),
+            id='daily_stats',
+            name='每日交易统计',
+            replace_existing=True
+        )
         
         # 每天凌晨2点训练深度学习模型（如果数据足够）
-        schedule.every().day.at("02:00").do(lambda: (
-            print("🔄 开始定期训练深度学习模型..."),
+        def train_dl_model():
+            print("🔄 开始定期训练深度学习模型...")
             train_deep_learning_model()
-        ))
+        
+        scheduler.add_job(
+            train_dl_model,
+            trigger=CronTrigger(hour=2, minute=0),
+            id='train_dl_model',
+            name='训练深度学习模型',
+            replace_existing=True
+        )
         
         # 每天凌晨3点执行自我修正
-        schedule.every().day.at("03:00").do(lambda: (
-            print("🧠 开始算法自我修正..."),
+        def self_correct():
+            print("🧠 开始算法自我修正...")
             self_correct_trading_algorithm()
-        ))
         
-        # 检查是否需要训练模型（每100个新信号后）
-        def check_and_train_model():
-            if os.path.exists(SIGNAL_HISTORY_FILE):
-                with open(SIGNAL_HISTORY_FILE, 'r', encoding='utf-8') as f:
-                    history = json.load(f)
-                if len(history) % DL_TRAIN_INTERVAL == 0 and len(history) >= DL_MIN_SIGNALS_FOR_TRAIN:
-                    print(f"🔄 检测到{len(history)}个信号，开始训练深度学习模型...")
-                    train_deep_learning_model()
+        scheduler.add_job(
+            self_correct,
+            trigger=CronTrigger(hour=3, minute=0),
+            id='self_correct',
+            name='算法自我修正',
+            replace_existing=True
+        )
         
         print(f"\n✅ 机器人运行中...")
         print(f"   - 每{MONITOR_INTERVAL//60}分钟检查一次ETH信号")
@@ -2137,12 +2428,12 @@ if __name__ == "__main__":
         print(f"按 Ctrl+C 停止\n")
         
         try:
-            while True:
-                schedule.run_pending()
-                time.sleep(1)
-        except KeyboardInterrupt:
+            # 启动BlockingScheduler（会阻塞主线程）
+            scheduler.start()
+        except (KeyboardInterrupt, SystemExit):
             log("🛑 机器人已停止", send_to_telegram=True)
             print("\n机器人已停止")
+            scheduler.shutdown()
             # 显示最终统计
             stats = get_trade_statistics()
             if stats:
