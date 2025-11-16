@@ -7,10 +7,16 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 import joblib
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
+# 使用UTC时区
+try:
+    from pytz import utc
+except ImportError:
+    # 如果pytz未安装，使用Python内置的timezone.utc
+    utc = timezone.utc
 import sys
 import ta  # 技术指标库
 import json
@@ -242,7 +248,7 @@ def record_signal_history(signal):
         
         # 记录信号
         signal_record = {
-            'timestamp': datetime.now().isoformat(),
+            'timestamp': datetime.now(timezone.utc).isoformat(),
             'signal_id': len(history) + 1,
             'direction': signal.get('direction'),
             'signal_strength': signal.get('signal_strength', 0),
@@ -297,7 +303,7 @@ def evaluate_signal_history():
             return
         
         current_price = df.iloc[-1]['close']
-        current_time = datetime.now()
+        current_time = datetime.now(timezone.utc)
         
         updated = False
         for record in history:
@@ -1374,7 +1380,7 @@ def should_send_signal(signal_details):
     try:
         direction = signal_details.get('direction')
         entry_price = signal_details.get('entry_price', 0)
-        current_time = datetime.now()
+        current_time = datetime.now(timezone.utc)
         
         # 读取上次发送的信号记录
         if os.path.exists(LAST_SIGNAL_FILE):
@@ -1495,7 +1501,7 @@ def send_trading_signal(signal_details):
                         message += f"(盈亏比: {entry['risk_reward']:.2f}:1)\n"
                 message += "\n"
             
-            message += f"<b>⏰ 时间:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            message += f"<b>⏰ 时间:</b> {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
             message += f"━━━━━━━━━━━━━━━━━━━━\n"
             message += f"⚠️ <i>此为分析信号，请结合市场情况谨慎操作</i>\n"
             message += f"🚀 <b>立即关注！适合交易的时机</b>"
@@ -1532,7 +1538,7 @@ def send_trading_signal(signal_details):
             message += f"止损价格: <b>{stop_loss:.2f} USDT</b>\n"
             message += f"止盈价格: <b>{take_profit:.2f} USDT</b>\n"
             message += f"盈亏比: <b>{risk_reward_ratio:.2f}:1</b>\n\n"
-            message += f"<b>⏰ 时间:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            message += f"<b>⏰ 时间:</b> {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
             message += f"━━━━━━━━━━━━━━━━━━━━\n"
             message += f"🚀 <b>立即关注！适合交易的时机</b>"
         
@@ -1577,7 +1583,7 @@ def send_telegram(message):
 
 # 日志
 def log(message, send_to_telegram=True):
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     log_message = f"[{timestamp}] {message}"
     with open(LOG_FILE, 'a', encoding='utf-8') as f:
         f.write(log_message + "\n")
@@ -1933,7 +1939,7 @@ def execute_trade(signal):
             'signal_strength': signal['signal_strength'],
             'risk_reward_ratio': signal['risk_reward_ratio'],
             'order_id': order.get('id'),
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.now(timezone.utc).isoformat()
         })
         
         trade_msg = f"✅ <b>开仓成功 - {direction} ETH合约</b>\n\n" \
@@ -2008,7 +2014,7 @@ def close_position(position):
             'pnl': unrealized_pnl,  # 使用实际的未实现盈亏
             'pnl_pct': percentage,
             'order_id': order.get('id'),
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.now(timezone.utc).isoformat()
         })
         
         close_msg = f"✅ <b>平仓成功</b>\n\n" \
@@ -2149,13 +2155,24 @@ def get_trade_statistics():
 def monitor_eth():
     """实时监控ETH走势，使用均线+形态+FVG+深度学习分析，发现交易机会时自动交易"""
     try:
-        # 1. 先检查当前持仓的止损止盈
+        # 获取当前UTC时间
+        utc_now = datetime.now(timezone.utc)
+        utc_time_str = utc_now.strftime("%Y-%m-%d %H:%M:%S UTC")
+        print(f"⏰ [{utc_time_str}] 定时触发，准备获取K线数据...")
+        
+        # 1. 先检查当前持仓的止损止盈（不依赖K线数据，可以立即执行）
         check_stop_loss_take_profit()
         
-        # 2. 评估历史信号（更新信号质量）
+        # 2. 延迟1秒后获取K线数据并分析（确保K线数据已更新）
+        time.sleep(1)
+        utc_now_after_delay = datetime.now(timezone.utc)
+        utc_time_str_after = utc_now_after_delay.strftime("%Y-%m-%d %H:%M:%S UTC")
+        print(f"⏰ [{utc_time_str_after}] 延迟1秒后开始获取K线数据并分析...")
+        
+        # 3. 评估历史信号（更新信号质量）- 需要K线数据，在延迟后执行
         evaluate_signal_history()
         
-        # 3. 使用高级分析（均线+形态+FVG+深度学习）
+        # 4. 使用高级分析（均线+形态+FVG+深度学习）- 需要K线数据，在延迟后执行
         signal = analyze_eth_advanced()
         
         if signal:
@@ -2195,7 +2212,7 @@ def monitor_eth():
                     contracts = position.get('contracts', 0)
                     position_info = f" | 持仓: {position['side']} {contracts}张 | 盈亏: {unrealized_pnl:+.2f} USDT ({pnl_pct:+.2f}%)"
                 
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
                 log_message = f"[{timestamp}] ETH监控中... 当前价格: {current_price:.2f} USDT (观望中，等待合适信号){position_info}"
                 print(log_message)
                 # 只写入日志文件，不发送Telegram通知
@@ -2216,7 +2233,7 @@ def analyze_all_coins():
     """分析所有监控币种的走势，用于参考"""
     try:
         summary = "📊 <b>市场走势分析</b>\n\n"
-        summary += f"分析时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        summary += f"分析时间: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
         
         for coin in COINS:
             symbol = f"{coin}/USDT"
@@ -2332,19 +2349,20 @@ if __name__ == "__main__":
         # 立即执行一次分析
         monitor_eth()
         
-        # 创建BlockingScheduler调度器
-        scheduler = BlockingScheduler()
+        # 创建BlockingScheduler调度器，使用UTC时区
+        scheduler = BlockingScheduler(timezone=utc)
         
-        # 定时任务：每N分钟监控一次ETH
+        # 定时任务：每5分钟在特定时间点监控ETH（UTC时间）
+        # 在每小时的0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55分钟触发
         scheduler.add_job(
             monitor_eth,
-            trigger=IntervalTrigger(minutes=MONITOR_INTERVAL // 60),
+            trigger=CronTrigger(minute='0,5,10,15,20,25,30,35,40,45,50,55', timezone=utc),
             id='monitor_eth',
-            name='监控ETH走势',
+            name='监控ETH走势（每5分钟UTC时间）',
             replace_existing=True
         )
         
-        # 每1分钟检查一次止损止盈（更频繁检查）
+        # 每1分钟检查一次止损止盈（更频繁检查，使用调度器的UTC时区）
         scheduler.add_job(
             check_stop_loss_take_profit,
             trigger=IntervalTrigger(minutes=1),
@@ -2353,7 +2371,7 @@ if __name__ == "__main__":
             replace_existing=True
         )
         
-        # 每小时显示一次账户状态
+        # 每小时显示一次账户状态（使用调度器的UTC时区）
         scheduler.add_job(
             check_status,
             trigger=IntervalTrigger(hours=1),
@@ -2362,16 +2380,16 @@ if __name__ == "__main__":
             replace_existing=True
         )
         
-        # 每天分析一次所有币种（可选）- 每天09:00
+        # 每天分析一次所有币种（可选）- 每天09:00 UTC
         scheduler.add_job(
             analyze_all_coins,
-            trigger=CronTrigger(hour=9, minute=0),
+            trigger=CronTrigger(hour=9, minute=0, timezone=utc),
             id='analyze_all_coins',
             name='分析所有币种',
             replace_existing=True
         )
         
-        # 每天显示交易统计 - 每天20:00
+        # 每天显示交易统计 - 每天20:00 UTC
         def daily_stats():
             stats = get_trade_statistics()
             if stats:
@@ -2381,41 +2399,43 @@ if __name__ == "__main__":
         
         scheduler.add_job(
             daily_stats,
-            trigger=CronTrigger(hour=20, minute=0),
+            trigger=CronTrigger(hour=20, minute=0, timezone=utc),
             id='daily_stats',
             name='每日交易统计',
             replace_existing=True
         )
         
-        # 每天凌晨2点训练深度学习模型（如果数据足够）
+        # 每天凌晨2点训练深度学习模型（如果数据足够）- UTC时间
         def train_dl_model():
             print("🔄 开始定期训练深度学习模型...")
             train_deep_learning_model()
         
         scheduler.add_job(
             train_dl_model,
-            trigger=CronTrigger(hour=2, minute=0),
+            trigger=CronTrigger(hour=2, minute=0, timezone=utc),
             id='train_dl_model',
             name='训练深度学习模型',
             replace_existing=True
         )
         
-        # 每天凌晨3点执行自我修正
+        # 每天凌晨3点执行自我修正 - UTC时间
         def self_correct():
             print("🧠 开始算法自我修正...")
             self_correct_trading_algorithm()
         
         scheduler.add_job(
             self_correct,
-            trigger=CronTrigger(hour=3, minute=0),
+            trigger=CronTrigger(hour=3, minute=0, timezone=utc),
             id='self_correct',
             name='算法自我修正',
             replace_existing=True
         )
         
         print(f"\n✅ 机器人运行中...")
-        print(f"   - 每{MONITOR_INTERVAL//60}分钟检查一次ETH信号")
+        print(f"   - 每5分钟在UTC时间的0,5,10,15,20,25,30,35,40,45,50,55分获取K线数据")
+        print(f"   - 获取K线后延迟1秒再分析（例如：18:15:00获取，18:15:01分析）")
         print(f"   - 每1分钟检查一次止损止盈")
+        print(f"   - 使用UTC时区（国际统一标准时间）")
         print(f"   - 自动交易: {'已启用' if AUTO_TRADE_ENABLED else '已禁用（仅监控模式）'}")
         if TENSORFLOW_AVAILABLE:
             print(f"   - 🤖 深度学习: 已启用（LSTM模型）")
