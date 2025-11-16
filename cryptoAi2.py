@@ -1,0 +1,809 @@
+"""
+加密货币合约自动交易系统
+根据高胜率策略构建指南实现：
+- 4小时定趋势，1小时找入口，15分钟精确定位
+- EMA金叉+RSI超跌回升+关键支撑位企稳
+- 止损设在支撑下方2%，阶段性止盈，移动止损
+- 单笔亏损不超过总资金1-2%
+- 记录交易日记
+- 买入点和卖出点发送Telegram通知
+"""
+
+import sys
+import io
+
+# 设置UTF-8编码输出（Windows兼容）
+if sys.platform == 'win32':
+    try:
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+    except:
+        pass  # 如果已经设置过，忽略错误
+
+import ccxt
+import pandas as pd
+import numpy as np
+import requests
+import time
+import json
+import os
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Tuple
+import ta  # 技术指标库
+
+class CryptoContractTrader:
+    def __init__(self, exchange_config: Dict, telegram_config: Dict, portfolio_size: float = 1000.0):
+        """
+        初始化交易系统
+        
+        Args:
+            exchange_config: 交易所配置 {'apiKey': str, 'secret': str, 'exchange': str}
+            telegram_config: Telegram配置 {'token': str, 'chat_id': str}
+            portfolio_size: 总资金（USDT）
+        """
+        # 初始化交易所
+        try:
+            exchange_class = getattr(ccxt, exchange_config.get('exchange', 'binance'))
+            self.exchange = exchange_class({
+                'apiKey': exchange_config.get('apiKey', ''),
+                'secret': exchange_config.get('secret', ''),
+                'enableRateLimit': True,
+                'options': {
+                    'defaultType': 'future',  # 合约交易
+                    'defaultMarginMode': 'isolated',  # 逐仓模式
+                }
+            })
+        except Exception as e:
+            print(f"⚠️ 交易所初始化警告: {e}")
+            print("⚠️ 将使用公共API模式（仅读取数据，无法交易）")
+            # 使用公共API模式
+            exchange_class = getattr(ccxt, exchange_config.get('exchange', 'binance'))
+            self.exchange = exchange_class({
+            'enableRateLimit': True,
+                'options': {
+                    'defaultType': 'future',
+                }
+        })
+        
+        self.telegram_config = telegram_config
+        self.portfolio_size = portfolio_size
+        self.risk_per_trade = 0.015  # 1.5%风险（在1-2%之间）
+        
+        # 交易记录文件
+        self.trade_journal_file = 'trading_journal.json'
+        self.positions_file = 'active_positions.json'
+        
+        # 信号频率优化配置（可调整）
+        self.config = {
+            'trend_threshold': 30,      # 4小时趋势阈值（原50，降低以提高频率）
+            'entry_threshold': 40,      # 1小时入口阈值（原50，降低以提高频率）
+            'precision_threshold': 50,  # 15分钟精确阈值（原60，降低以提高频率）
+            'support_distance': 0.03,   # 支撑位距离（原0.02，放宽到3%）
+            'signal_cooldown': 300,     # 信号冷却时间（秒），避免重复信号
+            'enable_short': True,       # 启用做空信号
+            'flexible_trend': True,     # 灵活趋势判断（允许轻微趋势）
+        }
+        
+        # 信号冷却记录
+        self.last_signal_time = {}
+        
+        # 加载交易记录
+        self.load_trade_journal()
+        self.load_positions()
+        
+    def send_telegram(self, message: str, parse_mode: str = 'HTML'):
+        """发送Telegram通知"""
+        if not self.telegram_config or not self.telegram_config.get('token'):
+            print(f"⚠️ Telegram未配置，消息: {message}")
+            return
+        
+        try:
+            url = f"https://api.telegram.org/bot{self.telegram_config['token']}/sendMessage"
+            payload = {
+                'chat_id': self.telegram_config['chat_id'],
+                'text': message,
+                'parse_mode': parse_mode
+            }
+            response = requests.post(url, json=payload, timeout=10)
+            if response.status_code == 200:
+                print("✅ Telegram消息发送成功")
+            else:
+                print(f"❌ Telegram发送失败: {response.status_code} - {response.text}")
+        except Exception as e:
+            print(f"❌ Telegram发送错误: {e}")
+    
+    def get_multi_timeframe_data(self, symbol: str) -> Dict[str, pd.DataFrame]:
+        """
+        获取多时间框架数据
+        4小时定趋势，1小时找入口，15分钟精确定位
+        """
+        timeframes = {
+            '4h': '4h',  # 定趋势
+            '1h': '1h',  # 找入口
+            '15m': '15m'  # 精确定位
+        }
+        
+        data = {}
+        for name, tf in timeframes.items():
+            try:
+                ohlcv = self.exchange.fetch_ohlcv(symbol, tf, limit=200)
+                df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                data[name] = df
+            except Exception as e:
+                print(f"❌ 获取{name}数据失败: {e}")
+                return {}
+        
+        return data
+    
+    def calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        """计算技术指标"""
+        # EMA指标
+        df['ema_20'] = ta.trend.EMAIndicator(df['close'], window=20).ema_indicator()
+        df['ema_50'] = ta.trend.EMAIndicator(df['close'], window=50).ema_indicator()
+        
+        # RSI指标
+        df['rsi'] = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
+        
+        # MACD指标
+        macd = ta.trend.MACD(df['close'])
+        df['macd'] = macd.macd()
+        df['macd_signal'] = macd.macd_signal()
+        df['macd_hist'] = macd.macd_diff()
+        
+        # 支撑位和阻力位（使用最近20根K线的最低点和最高点）
+        df['support'] = df['low'].rolling(window=20, min_periods=1).min()
+        df['resistance'] = df['high'].rolling(window=20, min_periods=1).max()
+        
+        # ATR（用于计算止损）
+        df['atr'] = ta.volatility.AverageTrueRange(
+            df['high'], df['low'], df['close'], window=14
+        ).average_true_range()
+        
+        return df
+    
+    def check_ema_golden_cross(self, df: pd.DataFrame) -> Tuple[bool, str]:
+        """
+        检查EMA金叉
+        返回: (是否金叉, 描述)
+        """
+        if len(df) < 2:
+            return False, "数据不足"
+        
+        current = df.iloc[-1]
+        previous = df.iloc[-2]
+        
+        # EMA金叉：短期EMA上穿长期EMA
+        current_cross = current['ema_20'] > current['ema_50']
+        previous_cross = previous['ema_20'] <= previous['ema_50']
+        
+        if current_cross and previous_cross:
+            return True, "EMA金叉（20上穿50）"
+        elif current_cross:
+            return True, "EMA多头排列（20>50）"
+        else:
+            return False, "EMA未金叉"
+    
+    def check_rsi_oversold_rebound(self, df: pd.DataFrame) -> Tuple[bool, str]:
+        """
+        检查RSI超跌回升
+        返回: (是否超跌回升, 描述)
+        """
+        if len(df) < 3:
+            return False, "数据不足"
+        
+        current = df.iloc[-1]
+        prev1 = df.iloc[-2]
+        prev2 = df.iloc[-3]
+        
+        # RSI超跌回升：RSI从超卖区域（<30）回升
+        if prev2['rsi'] < 30 and prev1['rsi'] > prev2['rsi'] and current['rsi'] > prev1['rsi']:
+            return True, f"RSI超跌回升（{prev2['rsi']:.1f} → {prev1['rsi']:.1f} → {current['rsi']:.1f}）"
+        elif current['rsi'] < 30:
+            return True, f"RSI超卖（{current['rsi']:.1f}）"
+        elif current['rsi'] < 40 and current['rsi'] > prev1['rsi']:
+            return True, f"RSI从低位回升（{prev1['rsi']:.1f} → {current['rsi']:.1f}）"
+        else:
+            return False, f"RSI正常（{current['rsi']:.1f}）"
+    
+    def check_support_level(self, df: pd.DataFrame, price: float) -> Tuple[bool, float, str]:
+        """
+        检查关键支撑位企稳
+        返回: (是否企稳, 支撑位价格, 描述)
+        """
+        if len(df) < 20:
+            return False, 0, "数据不足"
+        
+        current = df.iloc[-1]
+        support = current['support']
+        
+        # 判断价格是否在支撑位附近（可配置距离）
+        support_distance = self.config['support_distance']
+        distance_pct = abs(price - support) / support
+        
+        if distance_pct <= support_distance:  # 可配置距离（默认3%）
+            # 检查是否企稳（最近3根K线都在支撑位上方）
+            recent_lows = df['low'].tail(3).values
+            if all(low >= support * 0.98 for low in recent_lows):
+                return True, support, f"价格在支撑位附近企稳（支撑: {support:.2f}, 距离: {distance_pct*100:.2f}%）"
+            else:
+                return False, support, f"价格接近支撑位但未企稳（支撑: {support:.2f}）"
+        else:
+            return False, support, f"价格远离支撑位（支撑: {support:.2f}, 距离: {distance_pct*100:.2f}%）"
+    
+    def analyze_trend_4h(self, df_4h: pd.DataFrame) -> Tuple[str, float, List[str]]:
+        """
+        4小时定趋势
+        返回: (趋势方向, 趋势强度, 理由列表)
+        """
+        df_4h = self.calculate_indicators(df_4h)
+        current = df_4h.iloc[-1]
+        
+        reasons = []
+        trend_score = 0
+        
+        # 1. EMA排列判断趋势
+        if current['ema_20'] > current['ema_50']:
+            trend_score += 30
+            reasons.append("4h EMA多头排列（20>50）")
+        else:
+            trend_score -= 30
+            reasons.append("4h EMA空头排列（20<50）")
+        
+        # 2. 价格与EMA关系
+        if current['close'] > current['ema_20']:
+            trend_score += 20
+            reasons.append("4h 价格在EMA20上方")
+        else:
+            trend_score -= 20
+            reasons.append("4h 价格在EMA20下方")
+        
+        # 3. MACD判断
+        if current['macd'] > current['macd_signal'] and current['macd_hist'] > 0:
+            trend_score += 20
+            reasons.append("4h MACD金叉且柱状图为正")
+        elif current['macd'] < current['macd_signal'] and current['macd_hist'] < 0:
+            trend_score -= 20
+            reasons.append("4h MACD死叉且柱状图为负")
+        
+        # 4. 趋势强度（优化：降低阈值以提高信号频率）
+        trend_threshold = self.config['trend_threshold']
+        
+        if self.config['flexible_trend']:
+            # 灵活趋势判断：允许轻微趋势
+            if abs(trend_score) >= trend_threshold:
+                direction = 'LONG' if trend_score > 0 else 'SHORT'
+            elif abs(trend_score) >= trend_threshold * 0.7:  # 70%阈值作为轻微趋势
+                # 轻微趋势：如果其他条件很好，也可以考虑
+                direction = 'LONG' if trend_score > 0 else 'SHORT'
+                reasons.append(f"⚠️ 轻微趋势（强度: {abs(trend_score):.1f}）")
+            else:
+                direction = 'NEUTRAL'
+        else:
+            # 严格趋势判断
+            if abs(trend_score) >= trend_threshold:
+                direction = 'LONG' if trend_score > 0 else 'SHORT'
+            else:
+                direction = 'NEUTRAL'
+        
+        return direction, abs(trend_score), reasons
+    
+    def find_entry_1h(self, df_1h: pd.DataFrame, trend_4h: str) -> Tuple[bool, Dict, List[str]]:
+        """
+        1小时找入口
+        返回: (是否找到入口, 入场信息, 理由列表)
+        """
+        if trend_4h == 'NEUTRAL':
+            return False, {}, ["4小时趋势不明确，不寻找入口"]
+        
+        df_1h = self.calculate_indicators(df_1h)
+        current = df_1h.iloc[-1]
+        price = current['close']
+        
+        reasons = []
+        entry_score = 0
+        
+        # 1. EMA金叉
+        ema_cross, ema_desc = self.check_ema_golden_cross(df_1h)
+        if ema_cross:
+            if trend_4h == 'LONG':
+                entry_score += 30
+                reasons.append(f"1h {ema_desc}")
+            elif trend_4h == 'SHORT' and self.config['enable_short']:
+                # 做空：EMA死叉
+                if current['ema_20'] < current['ema_50']:
+                    entry_score += 30
+                    reasons.append(f"1h EMA空头排列（20<50）")
+        
+        # 2. RSI超跌回升（做多）或超买回落（做空）
+        rsi_rebound, rsi_desc = self.check_rsi_oversold_rebound(df_1h)
+        if rsi_rebound:
+            if trend_4h == 'LONG':
+                entry_score += 25
+                reasons.append(f"1h {rsi_desc}")
+            elif trend_4h == 'SHORT' and self.config['enable_short']:
+                # 做空：RSI超买回落
+                if current['rsi'] > 70:
+                    entry_score += 25
+                    reasons.append(f"1h RSI超买（{current['rsi']:.1f}）")
+        
+        # 3. 关键支撑位企稳（做多）或阻力位受阻（做空）
+        support_ok, support_price, support_desc = self.check_support_level(df_1h, price)
+        if support_ok:
+            if trend_4h == 'LONG':
+                entry_score += 25
+                reasons.append(f"1h {support_desc}")
+            elif trend_4h == 'SHORT' and self.config['enable_short']:
+                # 做空：接近阻力位
+                resistance = current['resistance']
+                resistance_distance = abs(price - resistance) / resistance
+                if resistance_distance <= self.config['support_distance']:
+                    entry_score += 25
+                    reasons.append(f"1h 接近阻力位（阻力: {resistance:.2f}, 距离: {resistance_distance*100:.2f}%）")
+        
+        # 4. 方向一致性检查
+        if trend_4h == 'LONG':
+            if current['close'] > current['ema_20']:
+                entry_score += 20
+                reasons.append("1h 价格在EMA20上方，方向一致")
+        elif trend_4h == 'SHORT' and self.config['enable_short']:
+            if current['close'] < current['ema_20']:
+                entry_score += 20
+                reasons.append("1h 价格在EMA20下方，方向一致")
+        
+        # 判断是否找到入口（优化：降低阈值以提高信号频率）
+        entry_threshold = self.config['entry_threshold']
+        if entry_score >= entry_threshold:
+            entry_info = {
+                'price': price,
+                'support': support_price if support_ok else current['support'],
+                'atr': current['atr'],
+                'rsi': current['rsi'],
+                'score': entry_score
+            }
+            return True, entry_info, reasons
+        else:
+            return False, {}, reasons
+    
+    def precise_entry_15m(self, df_15m: pd.DataFrame, trend_4h: str, entry_1h: Dict) -> Tuple[bool, Dict, List[str]]:
+        """
+        15分钟精确定位
+        返回: (是否精确定位, 精确入场信息, 理由列表)
+        """
+        if not entry_1h:
+            return False, {}, ["1小时未找到入口"]
+        
+        df_15m = self.calculate_indicators(df_15m)
+        current = df_15m.iloc[-1]
+        price = current['close']
+        
+        reasons = []
+        precision_score = 0
+        
+        # 1. 15分钟级别确认方向（支持做多和做空）
+        if trend_4h == 'LONG':
+            if current['ema_20'] > current['ema_50']:
+                precision_score += 30
+                reasons.append("15m EMA多头排列")
+            
+            if current['close'] > current['ema_20']:
+                precision_score += 20
+                reasons.append("15m 价格在EMA20上方")
+            
+            # 检查是否在支撑位附近
+            support_ok, support_price, support_desc = self.check_support_level(df_15m, price)
+            if support_ok:
+                precision_score += 25
+                reasons.append(f"15m {support_desc}")
+            
+            # RSI确认
+            if 30 < current['rsi'] < 70:
+                precision_score += 15
+                reasons.append(f"15m RSI正常区间（{current['rsi']:.1f}）")
+            elif current['rsi'] < 40:
+                precision_score += 10
+                reasons.append(f"15m RSI偏低但可接受（{current['rsi']:.1f}）")
+        
+        elif trend_4h == 'SHORT' and self.config['enable_short']:
+            # 做空信号
+            if current['ema_20'] < current['ema_50']:
+                precision_score += 30
+                reasons.append("15m EMA空头排列")
+            
+            if current['close'] < current['ema_20']:
+                precision_score += 20
+                reasons.append("15m 价格在EMA20下方")
+            
+            # 检查是否在阻力位附近
+            resistance = current['resistance']
+            resistance_distance = abs(price - resistance) / resistance
+            if resistance_distance <= self.config['support_distance']:
+                precision_score += 25
+                reasons.append(f"15m 接近阻力位（阻力: {resistance:.2f}, 距离: {resistance_distance*100:.2f}%）")
+            
+            # RSI确认（做空）
+            if 30 < current['rsi'] < 70:
+                precision_score += 15
+                reasons.append(f"15m RSI正常区间（{current['rsi']:.1f}）")
+            elif current['rsi'] > 60:
+                precision_score += 10
+                reasons.append(f"15m RSI偏高但可接受（{current['rsi']:.1f}）")
+        
+        # 判断是否精确定位（优化：降低阈值以提高信号频率）
+        precision_threshold = self.config['precision_threshold']
+        if precision_score >= precision_threshold:
+            precise_entry = {
+                'price': price,
+                'support': support_price if support_ok else current['support'],
+                'atr': current['atr'],
+                'rsi': current['rsi'],
+                'score': precision_score,
+                'entry_1h_price': entry_1h['price']
+            }
+            return True, precise_entry, reasons
+        else:
+            return False, {}, reasons
+    
+    def calculate_stop_loss_take_profit(self, entry_price: float, support_price: float, 
+                                       atr: float, direction: str) -> Tuple[float, float, List[float]]:
+        """
+        计算止损和止盈
+        止损设在支撑下方2%，阶段性止盈
+        """
+        if direction == 'LONG':
+            # 止损：支撑位下方2%
+            stop_loss = support_price * 0.98
+            
+            # 确保止损不超过入场价的2%
+            max_stop_loss = entry_price * 0.98
+            stop_loss = min(stop_loss, max_stop_loss)
+            
+            # 阶段性止盈：1.5倍、2倍、3倍风险
+            risk = entry_price - stop_loss
+            take_profit_1 = entry_price + risk * 1.5
+            take_profit_2 = entry_price + risk * 2.0
+            take_profit_3 = entry_price + risk * 3.0
+            
+            take_profits = [take_profit_1, take_profit_2, take_profit_3]
+        else:  # SHORT
+            # 止损：阻力位上方2%（这里简化处理，实际应该用阻力位）
+            stop_loss = entry_price * 1.02
+            
+            # 阶段性止盈
+            risk = stop_loss - entry_price
+            take_profit_1 = entry_price - risk * 1.5
+            take_profit_2 = entry_price - risk * 2.0
+            take_profit_3 = entry_price - risk * 3.0
+            
+            take_profits = [take_profit_1, take_profit_2, take_profit_3]
+        
+        return stop_loss, take_profit_3, take_profits
+    
+    def calculate_position_size(self, entry_price: float, stop_loss: float) -> float:
+        """
+        计算仓位大小
+        单笔亏损不超过总资金1-2%
+        """
+        risk_amount = self.portfolio_size * self.risk_per_trade
+        risk_per_contract = abs(entry_price - stop_loss)
+        
+        if risk_per_contract == 0:
+            return 0
+        
+        # 合约数量（简化计算，实际需要考虑合约面值）
+        position_size = risk_amount / risk_per_contract
+        
+        return position_size
+    
+    def check_signal_cooldown(self, symbol: str, direction: str) -> bool:
+        """检查信号冷却时间，避免重复信号"""
+        cooldown = self.config['signal_cooldown']
+        key = f"{symbol}_{direction}"
+        current_time = time.time()
+        
+        if key in self.last_signal_time:
+            time_passed = current_time - self.last_signal_time[key]
+            if time_passed < cooldown:
+                return False  # 还在冷却期
+        
+        self.last_signal_time[key] = current_time
+        return True  # 可以发送信号
+    
+    def generate_trading_signal(self, symbol: str) -> Optional[Dict]:
+        """
+        生成交易信号
+        完整流程：4小时定趋势 -> 1小时找入口 -> 15分钟精确定位
+        优化：降低阈值以提高信号频率，适合加密货币快速变化的市场
+        """
+        # 1. 获取多时间框架数据
+        data = self.get_multi_timeframe_data(symbol)
+        if not data or len(data) < 3:
+            return None
+        
+        df_4h = data['4h']
+        df_1h = data['1h']
+        df_15m = data['15m']
+        
+        # 2. 4小时定趋势（优化：降低阈值）
+        trend_4h, trend_strength, trend_reasons = self.analyze_trend_4h(df_4h)
+        if trend_4h == 'NEUTRAL':
+            return None
+        
+        # 3. 1小时找入口
+        entry_found, entry_1h, entry_reasons = self.find_entry_1h(df_1h, trend_4h)
+        if not entry_found:
+            return None
+        
+        # 4. 15分钟精确定位
+        precise_found, precise_entry, precise_reasons = self.precise_entry_15m(df_15m, trend_4h, entry_1h)
+        if not precise_found:
+            return None
+        
+        # 5. 计算止损止盈
+        stop_loss, final_take_profit, take_profits = self.calculate_stop_loss_take_profit(
+            precise_entry['price'],
+            precise_entry['support'],
+            precise_entry['atr'],
+            trend_4h
+        )
+        
+        # 6. 计算仓位
+        position_size = self.calculate_position_size(precise_entry['price'], stop_loss)
+        
+        # 7. 检查信号冷却时间（避免重复信号）
+        if not self.check_signal_cooldown(symbol, trend_4h):
+            return None  # 信号在冷却期，不生成
+        
+        # 8. 构建信号
+        signal = {
+            'symbol': symbol,
+            'direction': trend_4h,
+            'entry_price': precise_entry['price'],
+            'stop_loss': stop_loss,
+            'take_profit': final_take_profit,
+            'take_profits': take_profits,  # 阶段性止盈
+            'position_size': position_size,
+            'trend_strength': trend_strength,
+            'entry_score': entry_1h['score'],
+            'precision_score': precise_entry['score'],
+            'reasons': {
+                'trend_4h': trend_reasons,
+                'entry_1h': entry_reasons,
+                'precise_15m': precise_reasons
+            },
+            'timestamp': datetime.now(timezone.utc).isoformat()
+        }
+        
+        return signal
+    
+    def send_buy_signal(self, signal: Dict):
+        """发送买入信号到Telegram"""
+        message = f"🚀 <b>买入信号</b> 🚀\n\n"
+        message += f"━━━━━━━━━━━━━━━━━━━━\n"
+        message += f"<b>币种:</b> {signal['symbol']}\n"
+        message += f"<b>方向:</b> {signal['direction']}\n\n"
+        
+        message += f"<b>💰 价格信息</b>\n"
+        message += f"入场价格: <b>{signal['entry_price']:.4f} USDT</b>\n"
+        message += f"止损价格: <b>{signal['stop_loss']:.4f} USDT</b>\n"
+        message += f"最终止盈: <b>{signal['take_profit']:.4f} USDT</b>\n"
+        message += f"仓位大小: {signal['position_size']:.2f} 合约\n\n"
+        
+        message += f"<b>📊 阶段性止盈</b>\n"
+        for i, tp in enumerate(signal['take_profits'], 1):
+            message += f"止盈{i}: {tp:.4f} USDT\n"
+        message += "\n"
+        
+        message += f"<b>📈 信号强度</b>\n"
+        message += f"趋势强度: {signal['trend_strength']:.1f}/100\n"
+        message += f"入口得分: {signal['entry_score']:.1f}/100\n"
+        message += f"精确得分: {signal['precision_score']:.1f}/100\n\n"
+        
+        message += f"<b>📝 分析理由</b>\n"
+        message += f"<b>4小时趋势:</b>\n"
+        for reason in signal['reasons']['trend_4h']:
+            message += f"  • {reason}\n"
+        message += f"\n<b>1小时入口:</b>\n"
+        for reason in signal['reasons']['entry_1h']:
+            message += f"  • {reason}\n"
+        message += f"\n<b>15分钟定位:</b>\n"
+        for reason in signal['reasons']['precise_15m']:
+            message += f"  • {reason}\n"
+        message += "\n"
+        
+        message += f"<b>⏰ 时间:</b> {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
+        message += f"━━━━━━━━━━━━━━━━━━━━\n"
+        message += f"⚠️ <i>请结合市场情况谨慎操作</i>"
+        
+        self.send_telegram(message)
+    
+    def send_sell_signal(self, signal: Dict):
+        """发送卖出信号到Telegram"""
+        message = f"📉 <b>卖出信号</b> 📉\n\n"
+        message += f"━━━━━━━━━━━━━━━━━━━━\n"
+        message += f"<b>币种:</b> {signal['symbol']}\n"
+        message += f"<b>方向:</b> {signal['direction']}\n\n"
+        
+        message += f"<b>💰 价格信息</b>\n"
+        message += f"入场价格: <b>{signal['entry_price']:.4f} USDT</b>\n"
+        message += f"止损价格: <b>{signal['stop_loss']:.4f} USDT</b>\n"
+        message += f"最终止盈: <b>{signal['take_profit']:.4f} USDT</b>\n"
+        message += f"仓位大小: {signal['position_size']:.2f} 合约\n\n"
+        
+        message += f"<b>📊 阶段性止盈</b>\n"
+        for i, tp in enumerate(signal['take_profits'], 1):
+            message += f"止盈{i}: {tp:.4f} USDT\n"
+        message += "\n"
+        
+        message += f"<b>📈 信号强度</b>\n"
+        message += f"趋势强度: {signal['trend_strength']:.1f}/100\n"
+        message += f"入口得分: {signal['entry_score']:.1f}/100\n"
+        message += f"精确得分: {signal['precision_score']:.1f}/100\n\n"
+        
+        message += f"<b>📝 分析理由</b>\n"
+        message += f"<b>4小时趋势:</b>\n"
+        for reason in signal['reasons']['trend_4h']:
+            message += f"  • {reason}\n"
+        message += f"\n<b>1小时入口:</b>\n"
+        for reason in signal['reasons']['entry_1h']:
+            message += f"  • {reason}\n"
+        message += f"\n<b>15分钟定位:</b>\n"
+        for reason in signal['reasons']['precise_15m']:
+            message += f"  • {reason}\n"
+        message += "\n"
+        
+        message += f"<b>⏰ 时间:</b> {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
+        message += f"━━━━━━━━━━━━━━━━━━━━\n"
+        message += f"⚠️ <i>请结合市场情况谨慎操作</i>"
+        
+        self.send_telegram(message)
+    
+    def record_trade_journal(self, signal: Dict, action: str, result: Optional[Dict] = None):
+        """
+        记录交易日记
+        记录每笔交易的进出场理由、情绪状态等
+        """
+        journal_entry = {
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'action': action,  # 'BUY', 'SELL', 'STOP_LOSS', 'TAKE_PROFIT'
+            'symbol': signal['symbol'],
+            'direction': signal['direction'],
+            'entry_price': signal['entry_price'],
+            'stop_loss': signal['stop_loss'],
+            'take_profit': signal['take_profit'],
+            'position_size': signal['position_size'],
+            'reasons': signal['reasons'],
+            'signal_strength': {
+                'trend': signal['trend_strength'],
+                'entry': signal['entry_score'],
+                'precision': signal['precision_score']
+            },
+            'result': result  # 平仓时的结果（盈亏等）
+        }
+        
+        self.trade_journal.append(journal_entry)
+        self.save_trade_journal()
+    
+    def load_trade_journal(self):
+        """加载交易日记"""
+        if os.path.exists(self.trade_journal_file):
+            try:
+                with open(self.trade_journal_file, 'r', encoding='utf-8') as f:
+                    self.trade_journal = json.load(f)
+            except:
+                self.trade_journal = []
+        else:
+            self.trade_journal = []
+    
+    def save_trade_journal(self):
+        """保存交易日记"""
+        try:
+            with open(self.trade_journal_file, 'w', encoding='utf-8') as f:
+                json.dump(self.trade_journal, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"❌ 保存交易日记失败: {e}")
+    
+    def load_positions(self):
+        """加载持仓记录"""
+        if os.path.exists(self.positions_file):
+            try:
+                with open(self.positions_file, 'r', encoding='utf-8') as f:
+                    self.positions = json.load(f)
+            except:
+                self.positions = {}
+        else:
+            self.positions = {}
+    
+    def save_positions(self):
+        """保存持仓记录"""
+        try:
+            with open(self.positions_file, 'w', encoding='utf-8') as f:
+                json.dump(self.positions, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"❌ 保存持仓记录失败: {e}")
+    
+    def run(self, symbol: str = 'ETH/USDT:USDT', interval: int = 300):
+        """
+        运行交易系统
+        interval: 检查间隔（秒），默认5分钟
+        """
+        print(f"🚀 加密货币合约自动交易系统启动（优化版 - 提高信号频率）")
+        print(f"📊 监控币种: {symbol}")
+        print(f"⏱️ 检查间隔: {interval}秒")
+        print(f"💰 总资金: {self.portfolio_size} USDT")
+        print(f"⚠️ 单笔风险: {self.risk_per_trade*100:.1f}%")
+        print(f"📈 优化配置:")
+        print(f"   - 趋势阈值: {self.config['trend_threshold']} (原50)")
+        print(f"   - 入口阈值: {self.config['entry_threshold']} (原50)")
+        print(f"   - 精确阈值: {self.config['precision_threshold']} (原60)")
+        print(f"   - 支撑距离: {self.config['support_distance']*100:.1f}% (原2%)")
+        print(f"   - 信号冷却: {self.config['signal_cooldown']}秒")
+        print(f"   - 做空信号: {'启用' if self.config['enable_short'] else '禁用'}")
+        print(f"   - 灵活趋势: {'启用' if self.config['flexible_trend'] else '禁用'}")
+        print(f"━━━━━━━━━━━━━━━━━━━━\n")
+        
+        startup_msg = f"🤖 <b>交易系统启动</b>\n\n"
+        startup_msg += f"监控币种: {symbol}\n"
+        startup_msg += f"检查间隔: {interval}秒\n"
+        startup_msg += f"总资金: {self.portfolio_size} USDT\n"
+        startup_msg += f"单笔风险: {self.risk_per_trade*100:.1f}%\n"
+        self.send_telegram(startup_msg)
+        
+        while True:
+            try:
+                # 生成交易信号
+                signal = self.generate_trading_signal(symbol)
+                
+                if signal:
+                    # 发送信号通知
+                    if signal['direction'] == 'LONG':
+                        self.send_buy_signal(signal)
+                        # 记录交易日记
+                        self.record_trade_journal(signal, 'BUY')
+                    else:
+                        self.send_sell_signal(signal)
+                        # 记录交易日记
+                        self.record_trade_journal(signal, 'SELL')
+                    
+                    print(f"✅ 发现{signal['direction']}信号，已发送通知")
+                else:
+                    print(f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - 未发现交易信号，继续监控...")
+                
+                # 等待下次检查
+                time.sleep(interval)
+                
+            except KeyboardInterrupt:
+                print("\n🛑 系统停止")
+                self.send_telegram("🛑 <b>交易系统已停止</b>")
+                break
+            except Exception as e:
+                error_msg = f"❌ 系统错误: {str(e)}"
+                print(error_msg)
+                self.send_telegram(f"❌ <b>系统错误</b>\n\n{error_msg}")
+                time.sleep(60)  # 出错后等待1分钟再继续
+
+
+# 使用示例
+if __name__ == "__main__":
+    # 配置交易所（请替换为您的API密钥）
+    exchange_config = {
+        'exchange': 'binance',
+        'apiKey': 'YOUR_API_KEY',
+        'secret': 'YOUR_SECRET'
+    }
+    
+    # 配置Telegram（请替换为您的Bot Token和Chat ID）
+    telegram_config = {
+        'token': 'YOUR_TELEGRAM_BOT_TOKEN',
+        'chat_id': 'YOUR_TELEGRAM_CHAT_ID'
+    }
+    
+    # 创建交易系统
+    trader = CryptoContractTrader(
+        exchange_config=exchange_config,
+        telegram_config=telegram_config,
+        portfolio_size=1000.0  # 总资金1000 USDT
+    )
+    
+    # 运行系统（每5分钟检查一次）
+    trader.run(symbol='ETH/USDT:USDT', interval=300)
