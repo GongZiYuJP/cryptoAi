@@ -794,7 +794,7 @@ class CryptoContractTrader:
     
     def send_buy_signal(self, signal: Dict):
         """发送买入信号到Telegram（增强版，包含合约数据）"""
-        message = f"🚀 <b>买入信号</b> 🚀\n\n"
+        message = f"🚀 <b>买入信号 做多</b> 🚀\n\n"
         message += f"━━━━━━━━━━━━━━━━━━━━\n"
         message += f"<b>币种:</b> {signal['symbol']}\n"
         message += f"<b>方向:</b> {signal['direction']}\n\n"
@@ -859,7 +859,7 @@ class CryptoContractTrader:
     
     def send_sell_signal(self, signal: Dict):
         """发送卖出信号到Telegram（增强版，包含合约数据）"""
-        message = f"📉 <b>卖出信号</b> 📉\n\n"
+        message = f"📉 <b>卖出信号 做空</b> 📉\n\n"
         message += f"━━━━━━━━━━━━━━━━━━━━\n"
         message += f"<b>币种:</b> {signal['symbol']}\n"
         message += f"<b>方向:</b> {signal['direction']}\n\n"
