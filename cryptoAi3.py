@@ -82,6 +82,7 @@ class CryptoContractTrader:
             'signal_cooldown': 300,     # 信号冷却时间（秒），避免重复信号
             'enable_short': True,       # 启用做空信号
             'flexible_trend': True,     # 灵活趋势判断（允许轻微趋势）
+            'min_reward_risk': 2.5      # 最低盈亏比（奖励/风险）
         }
         
         # 信号冷却记录
@@ -644,7 +645,7 @@ class CryptoContractTrader:
             return False, {}, reasons
     
     def calculate_stop_loss_take_profit(self, entry_price: float, support_price: float, 
-                                       atr: float, direction: str) -> Tuple[float, float, List[float]]:
+                                       atr: float, direction: str) -> Tuple[float, float, List[float], float]:
         """
         计算止损和止盈
         止损设在支撑下方2%，阶段性止盈
@@ -664,6 +665,8 @@ class CryptoContractTrader:
             take_profit_3 = entry_price + risk * 3.0
             
             take_profits = [take_profit_1, take_profit_2, take_profit_3]
+            reward = take_profit_3 - entry_price
+            risk = max(entry_price - stop_loss, 0)
         else:  # SHORT
             # 止损：阻力位上方2%（这里简化处理，实际应该用阻力位）
             stop_loss = entry_price * 1.02
@@ -675,8 +678,11 @@ class CryptoContractTrader:
             take_profit_3 = entry_price - risk * 3.0
             
             take_profits = [take_profit_1, take_profit_2, take_profit_3]
+            reward = entry_price - take_profit_3
+            risk = max(risk, 0)
         
-        return stop_loss, take_profit_3, take_profits
+        reward_risk = (reward / risk) if risk > 0 else 0
+        return stop_loss, take_profit_3, take_profits, reward_risk
     
     def calculate_position_size(self, entry_price: float, stop_loss: float) -> float:
         """
@@ -707,6 +713,7 @@ class CryptoContractTrader:
         
         self.last_signal_time[key] = current_time
         return True  # 可以发送信号
+
     
     def generate_trading_signal(self, symbol: str) -> Optional[Dict]:
         """
@@ -751,12 +758,16 @@ class CryptoContractTrader:
             intraday_data = self.calculate_intraday_series(df_3m)
         
         # 7. 计算止损止盈
-        stop_loss, final_take_profit, take_profits = self.calculate_stop_loss_take_profit(
+        stop_loss, final_take_profit, take_profits, reward_risk = self.calculate_stop_loss_take_profit(
             precise_entry['price'],
             precise_entry['support'],
             precise_entry['atr'],
             trend_4h
         )
+        min_rr = self.config.get('min_reward_risk', 2.5)
+        if reward_risk < min_rr:
+            print(f"⚠️ {symbol} 当前盈亏比 {reward_risk:.2f}:1 低于阈值 {min_rr}:1，继续观察")
+            return None
         
         # 8. 计算仓位
         position_size = self.calculate_position_size(precise_entry['price'], stop_loss)
@@ -777,6 +788,7 @@ class CryptoContractTrader:
             'trend_strength': trend_strength,
             'entry_score': entry_1h['score'],
             'precision_score': precise_entry['score'],
+            'reward_risk': reward_risk,
             'reasons': {
                 'trend_4h': trend_reasons,
                 'entry_1h': entry_reasons,
@@ -803,7 +815,8 @@ class CryptoContractTrader:
         message += f"入场价格: <b>{signal['entry_price']:.4f} USDT</b>\n"
         message += f"止损价格: <b>{signal['stop_loss']:.4f} USDT</b>\n"
         message += f"最终止盈: <b>{signal['take_profit']:.4f} USDT</b>\n"
-        message += f"仓位大小: {signal['position_size']:.2f} 合约\n\n"
+        message += f"仓位大小: {signal['position_size']:.2f} 合约\n"
+        message += f"盈亏比: {signal['reward_risk']:.2f}:1\n\n"
         
         # 新增：价格变化（参考Go代码）
         if signal.get('price_changes'):
@@ -868,7 +881,8 @@ class CryptoContractTrader:
         message += f"入场价格: <b>{signal['entry_price']:.4f} USDT</b>\n"
         message += f"止损价格: <b>{signal['stop_loss']:.4f} USDT</b>\n"
         message += f"最终止盈: <b>{signal['take_profit']:.4f} USDT</b>\n"
-        message += f"仓位大小: {signal['position_size']:.2f} 合约\n\n"
+        message += f"仓位大小: {signal['position_size']:.2f} 合约\n"
+        message += f"盈亏比: {signal['reward_risk']:.2f}:1\n\n"
         
         # 新增：价格变化（参考Go代码）
         if signal.get('price_changes'):
@@ -1004,6 +1018,7 @@ class CryptoContractTrader:
         print(f"   - 信号冷却: {self.config['signal_cooldown']}秒")
         print(f"   - 做空信号: {'启用' if self.config['enable_short'] else '禁用'}")
         print(f"   - 灵活趋势: {'启用' if self.config['flexible_trend'] else '禁用'}")
+        print(f"   - 最低盈亏比: {self.config['min_reward_risk']}:1")
         print(f"━━━━━━━━━━━━━━━━━━━━\n")
         
         startup_msg = f"🤖 <b>交易系统启动</b>\n\n"
