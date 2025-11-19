@@ -40,6 +40,6 @@ trading_log.txt
 Thumbs.db
 
 # Sensitive data (if you want to keep them local)
-# config.py
+config.py
 # secrets.py
 
