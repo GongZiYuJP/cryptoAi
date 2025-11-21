@@ -1,0 +1,20 @@
+{
+  "symbols": [
+    "ETH/USDT"
+  ],
+  "timeframe": "15m",
+  "max_workers": 5,
+  "analysis_periods": {
+    "short_term": 20,
+    "medium_term": 48,
+    "long_term": 96,
+    "bollinger_window": 20
+  },
+  "atr_period": 14,
+  "adx_period": 14,
+  "adx_threshold": 24,
+  "api_retries": {
+    "max_retries": 3,
+    "retry_delay": 5
+  }
+}
