@@ -168,14 +168,18 @@ def calculate_atr_risk_parameters(signal_data, price_data, price_precision, conf
         atr_multiplier = config.get('atr_multiplier_low', 1.8)
 
     # 【风控计算 - 纯ATR版】
-    # 1. 直接根据ATR计算最终止损位
+    # 1. 根据ATR计算止损距离，并在原基础上再额外添加2%缓冲，减少被插针扫损
+    atr_distance = atr * atr_multiplier
+    extra_buffer_pct = config.get('extra_stop_loss_pct', 0.02)  # 额外2%
+    extra_buffer = current_price * extra_buffer_pct
+    stop_loss_distance = atr_distance + extra_buffer
+
     if signal == 'BUY':
-        final_stop_loss = current_price - (atr * atr_multiplier)
+        final_stop_loss = current_price - stop_loss_distance
     else:  # SELL
-        final_stop_loss = current_price + (atr * atr_multiplier)
+        final_stop_loss = current_price + stop_loss_distance
 
     # 2. 根据止损距离计算止盈位
-    stop_loss_distance = abs(current_price - final_stop_loss)
     take_profit_ratio = config.get('take_profit_ratio', 1.5)
     
     if signal == 'BUY':
